@@ -180,8 +180,14 @@ export const config = {
    *
    * `/api` is deliberately NOT excluded, so route handlers still receive a
    * freshly refreshed session cookie (and a 401 when there is no session).
+   *
+   * EXCEPTION: `/api/cron/` IS excluded. It is machine-to-machine (pg_net has no
+   * cookie), so the session check here would 401 it before the handler ever runs.
+   * The route authenticates itself with CRON_SECRET via timingSafeEqual. Excluding
+   * it in the matcher rather than in isPublicPath also skips a pointless getClaims()
+   * JWKS round-trip on all 288 ticks a day.
    */
   matcher: [
-    '/((?!_next/static|_next/image|_next/webpack-hmr|favicon\\.ico|robots\\.txt|sitemap\\.xml|sw\\.js|~offline|manifest\\.json|manifest\\.webmanifest|icons/|.*\\.(?:js|mjs|map|css|json|txt|xml|svg|png|jpg|jpeg|gif|webp|avif|ico|woff|woff2|ttf|otf)$).*)',
+    '/((?!_next/static|_next/image|_next/webpack-hmr|api/cron/|favicon\\.ico|robots\\.txt|sitemap\\.xml|sw\\.js|~offline|manifest\\.json|manifest\\.webmanifest|icons/|.*\\.(?:js|mjs|map|css|json|txt|xml|svg|png|jpg|jpeg|gif|webp|avif|ico|woff|woff2|ttf|otf)$).*)',
   ],
 }

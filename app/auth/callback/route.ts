@@ -1,5 +1,4 @@
 import { NextResponse, type NextRequest } from 'next/server'
-import type { EmailOtpType } from '@supabase/supabase-js'
 
 import { createClient } from '@/lib/supabase/server'
 
@@ -18,20 +17,6 @@ function safeNext(raw: string | null): string {
   if (!raw || !raw.startsWith('/')) return '/'
   if (raw.startsWith('//') || raw.startsWith('/\\')) return '/'
   return raw
-}
-
-const OTP_TYPES: ReadonlySet<string> = new Set<EmailOtpType>([
-  'magiclink',
-  'signup',
-  'invite',
-  'recovery',
-  'email_change',
-  'email',
-])
-
-/** Never hand an unvalidated string to `verifyOtp`. */
-function parseOtpType(raw: string | null): EmailOtpType | null {
-  return raw && OTP_TYPES.has(raw) ? (raw as EmailOtpType) : null
 }
 
 /**
@@ -78,36 +63,29 @@ export async function GET(request: NextRequest) {
     return response
   }
 
-  // Supabase reports link failures on the redirect itself (expired link,
-  // already-used link, access_denied). Check before anything else, or the
-  // real reason is thrown away and the user sees a blank form.
+  // Google/GoTrue report failures on the redirect itself (user pressed 취소,
+  // provider disabled, temporary Google outage). Check before anything else,
+  // or the real reason is thrown away and the user sees a blank form.
   const providerError =
     searchParams.get('error_code') ?? searchParams.get('error')
   if (providerError) {
     return failWith(providerError)
   }
 
+  // Google OAuth is PKCE, exactly like the magic link used to be: the flow
+  // always comes back as ?code=... There is no token_hash branch any more.
   const code = searchParams.get('code')
-  const tokenHash = searchParams.get('token_hash')
-  const type = parseOtpType(searchParams.get('type'))
+  if (!code) return failWith('missing_code')
 
   // A route handler CAN write cookies, so the session lands in this response.
   const supabase = await createClient()
 
-  if (code) {
-    // PKCE flow: the magic link came back with ?code=...
-    // Single-use, ~5 minute lifetime, and the code verifier lives in the
-    // browser that requested it -- the link must be opened on the same device.
-    const { error } = await supabase.auth.exchangeCodeForSession(code)
-    if (error) return failWith(error.code ?? 'exchange_failed')
-  } else if (tokenHash && type) {
-    // Token-hash flow, for the email template that sends
-    //   {{ .SiteURL }}/auth/callback?token_hash={{ .TokenHash }}&type=magiclink
-    const { error } = await supabase.auth.verifyOtp({ type, token_hash: tokenHash })
-    if (error) return failWith(error.code ?? 'verify_failed')
-  } else {
-    return failWith('missing_code')
-  }
+  // Single-use, ~5 minute lifetime. The PKCE verifier lives in a cookie on the
+  // browser that STARTED the flow, so the round trip must finish in the same
+  // browser instance -- on iOS the installed app and Safari are two different
+  // cookie jars, which is why /login pushes people to install first.
+  const { error } = await supabase.auth.exchangeCodeForSession(code)
+  if (error) return failWith(error.code ?? 'exchange_failed')
 
   const response = NextResponse.redirect(new URL(next, baseUrl))
   response.headers.set('Cache-Control', 'private, no-store, max-age=0')

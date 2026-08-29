@@ -67,6 +67,19 @@ export type Database = {
   public: {
     Tables: {
       profiles: {
+        /**
+         * ★ 0003 NARROWED THE SELECT GRANT TO COLUMNS ★
+         *
+         * `grant select (id, display_name, avatar_emoji, timezone, created_at)`
+         * — exactly the same trap `groups.invite_code` already sets:
+         *
+         *   .from('profiles').select('*')                       -> 42501
+         *   .from('profiles').select('id, display_name, ...')    -> fine
+         *
+         * The three `auto_nudge_*` columns below are listed because they exist
+         * on the row and the SERVICE ROLE reads them. A signed-in client cannot
+         * select them at all; its only read path is `rpc('get_auto_nudge')`.
+         */
         Row: {
           /** Same value as auth.users.id. */
           id: string
@@ -78,6 +91,27 @@ export type Database = {
           /** NOT NULL, DEFAULT 'Asia/Seoul'. IANA zone name. */
           timezone: string
           created_at: string
+          /**
+           * [0003] Auto-reminder opt-in. NOT NULL, DEFAULT false.
+           * SERVICE ROLE ONLY over the Data API — see the note above.
+           */
+          auto_nudge_enabled: boolean
+          /**
+           * [0003] NOT NULL, DEFAULT '21:00'. SQL type `time` (no zone), so it
+           * serialises as 'HH:MM:SS' and is interpreted in `timezone` above —
+           * never in UTC and never in the browser's zone. Constrained to
+           * 5-minute boundaries with seconds = 0 by
+           * `profiles_auto_nudge_at_5min_chk`.
+           * SERVICE ROLE ONLY over the Data API.
+           */
+          auto_nudge_at: string
+          /**
+           * [0003] DATE ('YYYY-MM-DD') of the last auto reminder, in THAT
+           * USER'S local timezone. NULL = never sent. This is the entire
+           * once-per-local-day idempotency guard.
+           * SERVICE ROLE ONLY over the Data API.
+           */
+          auto_nudge_last_on: string | null
         }
         /** Rows are created by the `handle_new_user` trigger, not by clients. */
         Insert: {
@@ -86,7 +120,17 @@ export type Database = {
           avatar_emoji?: string
           timezone?: string
         }
-        /** Column grant is `update (display_name, avatar_emoji, timezone)`. */
+        /**
+         * Column grant is `update (display_name, avatar_emoji, timezone)` —
+         * 0003 deliberately did NOT extend it.
+         *
+         * ★ Do not add `auto_nudge_*` here. ★ Leaving them out of the grant is
+         * what makes `rpc('set_auto_nudge')` the structurally only write path,
+         * and that RPC is the one place the "already passed today?" recompute
+         * for `auto_nudge_last_on` lives. A direct UPDATE would skip it and
+         * either fire an unexpected push seconds after the toggle or swallow a
+         * whole day's reminder.
+         */
         Update: {
           display_name?: string
           avatar_emoji?: string
@@ -282,8 +326,22 @@ export type Database = {
       nudges: {
         Row: {
           id: string
-          /** The sender. NOT `sender_id`. */
-          from_user_id: string
+          /**
+           * The sender. NOT `sender_id`.
+           *
+           * ★ NULLABLE SINCE 0003 ★ NULL means "the system" — an automatic
+           * self-reminder (`source: 'auto'`). The invariant is locked in by
+           * `nudges_source_sender_chk`:
+           *   source='auto'   <-> from_user_id IS NULL
+           *   source='manual' <-> from_user_id IS NOT NULL
+           *
+           * Same hazard as `groups.created_by`: TypeScript will happily compile
+           * `nudge.from_user_id.slice(0, 8)` and
+           * `profilesById[nudge.from_user_id]` — the first throws at runtime,
+           * the second silently yields `undefined`. Branch on `source` (or on
+           * `=== null`) and render the auto case as 자동 알림, never as a person.
+           */
+          from_user_id: string | null
           /** The recipient. NOT `recipient_id`. */
           to_user_id: string
           group_id: string
@@ -298,18 +356,28 @@ export type Database = {
          * where the 1/hour and 3/day limits are enforced atomically. A direct
          * INSERT would sidestep them entirely.
          *
-         * This shape exists for the auto-nudge cron, which runs with
-         * `createAdminClient()` and writes `source: 'auto'` on nobody's behalf.
-         * A CHECK constraint rejects `from_user_id = to_user_id`.
+         * In practice nothing in this app inserts here directly any more —
+         * automatic reminders are written by `public.run_auto_nudges()` inside
+         * the same transaction that stamps `auto_nudge_last_on`, which is what
+         * makes the batch idempotent. Splitting the insert out into TypeScript
+         * would break that.
+         *
+         * If you ever do write a row by hand, `nudges_source_sender_chk`
+         * requires `source: 'auto'` to carry `from_user_id: null` and
+         * `source: 'manual'` to carry a real one. `nudges_no_self_nudge_chk`
+         * still rejects `from_user_id = to_user_id` for manual rows (it passes
+         * vacuously for auto rows, because `NULL <> x` is NULL).
          */
         Insert: {
           id?: string
-          from_user_id: string
+          /** NULL = the system (an automatic reminder). Required to be null
+           *  when `source` is 'auto', and non-null when it is 'manual'. */
+          from_user_id?: string | null
           to_user_id: string
           group_id: string
           task_id?: string | null
           message?: string | null
-          /** DEFAULT 'manual'. The cron passes 'auto'. */
+          /** DEFAULT 'manual'. The scheduler writes 'auto'. */
           source?: NudgeSource
           created_at?: string
         }
@@ -427,6 +495,92 @@ export type Database = {
         Args: Record<PropertyKey, never>
         Returns: string
       }
+      /**
+       * [0003] SECURITY DEFINER. Saves the CALLER'S OWN auto-reminder setting.
+       *
+       * ★ INVARIANT: there is no user-identifying parameter, ever. ★ The target
+       * is always `auth.uid()`. Adding a `p_user_id` "for admin convenience"
+       * turns this RPC into a primitive for scheduling notifications at other
+       * people in exactly one line. The database comment says the same thing.
+       *
+       * `p_at` is a SQL `time` — send 'HH:MM:SS'. It must sit on a 5-minute
+       * boundary with seconds = 0 (the scheduler ticks every 5 minutes in UTC,
+       * and every IANA offset is a multiple of 15 minutes, so a 5-minute UTC
+       * boundary is a 5-minute local boundary everywhere). It is interpreted in
+       * `profiles.timezone`, never in UTC.
+       *
+       * Raises, rather than returning a reason code:
+       *   42501 — no session reached Postgres
+       *   22023 — `p_at` is not a 5-minute boundary, or `p_enabled` is null
+       *   P0002 — the caller has no `profiles` row
+       *
+       * Also recomputes `auto_nudge_last_on` ("has this time already passed
+       * today?"), which is what stops a toggle flipped at 22:00 from firing a
+       * push immediately, and stops a same-day time change from double-sending.
+       */
+      set_auto_nudge: {
+        Args: { p_enabled: boolean; p_at: string }
+        Returns: undefined
+      }
+      /**
+       * [0003] SECURITY DEFINER. Reads the CALLER'S OWN setting. No parameters,
+       * for the same reason `set_auto_nudge` has none.
+       *
+       * This is the ONLY read path: 0003 narrowed the `profiles` SELECT grant
+       * to columns and `auto_nudge_*` is not among them, so a groupmate cannot
+       * learn whether you use reminders or at what time.
+       *
+       * Always exactly one row (the function LEFT JOINs, so a missing profile
+       * yields defaults rather than an empty set). The column is `at_local`,
+       * not `at` — `AT` sits one token away from the `AT TIME ZONE` production
+       * and reads as a bug.
+       *
+       * Raises 42501 when there is no session.
+       */
+      get_auto_nudge: {
+        Args: Record<PropertyKey, never>
+        Returns: {
+          enabled: boolean
+          /** 'HH:MM:SS', interpreted in `profiles.timezone`. */
+          at_local: string
+          /** 'YYYY-MM-DD' in the user's local zone, or null if never sent. */
+          last_on: string | null
+        }[]
+      }
+      /**
+       * [0003] ★ SERVICE ROLE ONLY. NEVER CALL THIS FROM A BROWSER CLIENT. ★
+       *
+       * It is listed here only so app/api/cron/auto-nudge/route.ts — which runs
+       * with `createAdminClient()` — can be type-checked. Two independent things
+       * stop anyone else:
+       *   1. `revoke all ... from public, anon, authenticated` in 0003, and
+       *   2. a runtime guard that raises 42501 the moment `auth.uid()` is
+       *      non-null, so even a GRANT that accidentally comes back is closed.
+       * The return set is a roster of user ids plus activity metadata; exposing
+       * it would be a user-enumeration leak on top of a "notify everyone now"
+       * button.
+       *
+       * Selects everyone whose local time has reached their `auto_nudge_at`,
+       * who has not been reminded yet on their local date, and who still has an
+       * unfinished task today; inserts one `source='auto'` nudge each and
+       * stamps `auto_nudge_last_on`. Idempotent per user per local day, and
+       * serialised across concurrent runs with an advisory lock.
+       *
+       * Delivery is AT-MOST-ONCE: the claim commits here, the push fan-out
+       * happens afterwards in Node. If the route dies in between, that user
+       * loses today's reminder rather than getting two.
+       *
+       * `out_pending_count` counts unfinished tasks in the ONE group the
+       * function picked, not across all of the user's groups.
+       */
+      run_auto_nudges: {
+        Args: Record<PropertyKey, never>
+        Returns: {
+          out_to_user_id: string
+          out_group_id: string
+          out_pending_count: number
+        }[]
+      }
     }
     Enums: {
       [_ in never]: never
@@ -472,3 +626,9 @@ export type PushSubscriptionUpdate = TablesUpdate<'push_subscriptions'>
 
 /** The single row `send_nudge` returns, unwrapped from its array. */
 export type SendNudgeResult = FunctionReturns<'send_nudge'>[number]
+
+/** The single row `get_auto_nudge` returns, unwrapped from its array. */
+export type AutoNudgeSettings = FunctionReturns<'get_auto_nudge'>[number]
+
+/** One reminded user from `run_auto_nudges`. Service-role code only. */
+export type AutoNudgeRunRow = FunctionReturns<'run_auto_nudges'>[number]

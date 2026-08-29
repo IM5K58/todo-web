@@ -1,3 +1,7 @@
+// 이 모듈이 클라이언트 번들에 섞이면 service_role 키가 브라우저로 나갑니다.
+// server-only 는 그런 import 를 런타임이 아니라 빌드 시점에 실패시킵니다.
+import 'server-only'
+
 import { createClient as createSupabaseClient } from '@supabase/supabase-js'
 
 import type { Database } from '@/lib/supabase/types'

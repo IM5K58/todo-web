@@ -1,0 +1,42 @@
+{
+  "name": "daily-todo-pwa",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "node": ">=20.9.0" },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "next": "^16.3.3",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "@supabase/supabase-js": "^2.112.4",
+    "@supabase/ssr": "^0.12.5",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "@types/node": "^26.4.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@types/web-push": "^3.6.4",
+    "tailwindcss": "^4.3.3",
+    "@tailwindcss/postcss": "^4.3.3",
+    "postcss": "^8.5.26",
+    "serwist": "^9.5.12",
+    "@serwist/turbopack": "^9.5.12",
+    "esbuild": "^0.28.2",
+    "vitest": "^4.1.11",
+    "vite": "^8.2.2",
+    "@vitejs/plugin-react": "^6.1.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/jest-dom": "^7.0.1",
+    "jsdom": "^29.1.1"
+  }
+}

@@ -1,0 +1,141 @@
+@import 'tailwindcss';
+
+/* Class-based dark mode on top of the system default.
+   The raw vars below still honour prefers-color-scheme, so this only ADDS
+   a manual override hook (<html class="dark"> / class="light"). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---- Neutral, slightly-cool palette -------------------------------------- */
+:root {
+  --app-bg: oklch(0.98 0.002 250);
+  --app-surface: oklch(1 0 0);
+  --app-surface-2: oklch(0.96 0.003 250);
+  --app-fg: oklch(0.21 0.006 250);
+  --app-muted: oklch(0.52 0.008 250);
+  --app-border: oklch(0.91 0.004 250);
+  --app-accent: oklch(0.62 0.17 258);
+  --app-accent-fg: oklch(0.99 0 0);
+  --app-danger: oklch(0.58 0.19 25);
+}
+
+/* Follows the OS unless the user forced light via <html class="light">. */
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --app-bg: oklch(0.17 0.005 250);
+    --app-surface: oklch(0.21 0.006 250);
+    --app-surface-2: oklch(0.25 0.007 250);
+    --app-fg: oklch(0.95 0.003 250);
+    --app-muted: oklch(0.66 0.009 250);
+    --app-border: oklch(0.3 0.008 250);
+    --app-accent: oklch(0.7 0.15 258);
+    --app-accent-fg: oklch(0.17 0.005 250);
+    --app-danger: oklch(0.68 0.17 25);
+  }
+}
+
+/* Explicit manual override. */
+:root.dark {
+  --app-bg: oklch(0.17 0.005 250);
+  --app-surface: oklch(0.21 0.006 250);
+  --app-surface-2: oklch(0.25 0.007 250);
+  --app-fg: oklch(0.95 0.003 250);
+  --app-muted: oklch(0.66 0.009 250);
+  --app-border: oklch(0.3 0.008 250);
+  --app-accent: oklch(0.7 0.15 258);
+  --app-accent-fg: oklch(0.17 0.005 250);
+  --app-danger: oklch(0.68 0.17 25);
+}
+
+/* ---- Expose them as Tailwind utilities ----------------------------------- */
+/* `inline` keeps the var() reference in the utility, so the values above can
+   flip at runtime without regenerating CSS. */
+@theme inline {
+  --color-bg: var(--app-bg);
+  --color-surface: var(--app-surface);
+  --color-surface-2: var(--app-surface-2);
+  --color-fg: var(--app-fg);
+  --color-muted: var(--app-muted);
+  --color-line: var(--app-border);
+  --color-accent: var(--app-accent);
+  --color-accent-fg: var(--app-accent-fg);
+  --color-danger: var(--app-danger);
+
+  /* -> p-safe-top / pt-safe-bottom / mb-safe-bottom / h-safe-top ... */
+  --spacing-safe-top: env(safe-area-inset-top);
+  --spacing-safe-bottom: env(safe-area-inset-bottom);
+  --spacing-safe-left: env(safe-area-inset-left);
+  --spacing-safe-right: env(safe-area-inset-right);
+}
+
+/* ---- Mobile-first base --------------------------------------------------- */
+@layer base {
+  html {
+    /* Stop iOS Safari from re-flowing text on rotate. */
+    -webkit-text-size-adjust: 100%;
+    /* Kill pull-to-refresh + rubber-banding; this app owns its scroll. */
+    overscroll-behavior-y: none;
+    scrollbar-gutter: stable;
+  }
+
+  body {
+    background-color: var(--app-bg);
+    color: var(--app-fg);
+    overscroll-behavior-y: none;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* No grey flash on tap in standalone/PWA mode. */
+    -webkit-tap-highlight-color: transparent;
+    min-height: 100dvh;
+  }
+
+  /* iOS zooms the viewport when a focused input is under 16px. */
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+
+  button,
+  [role='button'] {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--app-accent);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+/* ---- Safe-area helpers --------------------------------------------------- */
+/* Guarantee a minimum inset even on devices reporting 0 (Android, desktop). */
+@utility pb-safe {
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+
+@utility pt-safe {
+  padding-top: max(1rem, env(safe-area-inset-top));
+}
+
+@utility px-safe {
+  padding-left: max(1rem, env(safe-area-inset-left));
+  padding-right: max(1rem, env(safe-area-inset-right));
+}
+
+/* Full-height container that respects the notch and home indicator. */
+@utility screen-safe {
+  min-height: 100dvh;
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}

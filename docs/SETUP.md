@@ -114,7 +114,7 @@ Supabase 대시보드에만 저장됩니다. 그래서 이 섹션에서 추가�
 
    - `<프로젝트-REF>`는 2번에서 복사한 Project URL의 그 문자열입니다
      (`https://abcdefghijklm.supabase.co` → `abcdefghijklm`).
-   - 정확한 값은 Supabase 대시보드 → **Authentication → Providers → Google**
+   - 정확한 값은 Supabase 대시보드 → **Authentication → Sign In / Providers → Google**
      페이지 맨 아래 **"Callback URL (for OAuth)"** 에 그대로 적혀 있습니다.
      **손으로 치지 말고 복사해서 붙여넣으세요.**
    - ❌ `https://내도메인.com/auth/callback` 은 여기 넣는 게 **아닙니다.**
@@ -130,7 +130,7 @@ Supabase 대시보드에만 저장됩니다. 그래서 이 섹션에서 추가�
 
 ### 4-B. Supabase 대시보드 — Google 공급자 켜기
 
-**Authentication → Providers → Google**
+**Authentication → Sign In / Providers → Google**
 
 1. **Enable Sign in with Google** 켜기
 2. **Client ID** 붙여넣기 (4-A-8)
@@ -140,7 +140,7 @@ Supabase 대시보드에만 저장됩니다. 그래서 이 섹션에서 추가�
 같은 페이지 아래쪽의 **Callback URL (for OAuth)** 가 4-A-7에 넣은 값과
 글자 하나까지 같은지 여기서 한 번 더 확인하세요.
 
-**Email 공급자는 꺼도 됩니다.** (Authentication → Providers → Email)
+**Email 공급자는 꺼도 됩니다.** (Authentication → Sign In / Providers → Email)
 앱이 더 이상 `signInWithOtp`를 호출하지 않습니다. 켜둬도 해는 없지만,
 안 쓰는 로그인 경로는 닫아두는 쪽이 낫습니다.
 

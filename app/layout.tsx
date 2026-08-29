@@ -1,5 +1,7 @@
 import type { Metadata, Viewport } from 'next'
 
+import BottomNav from '@/app/(nav)/BottomNav'
+
 import './globals.css'
 
 /**
@@ -69,7 +71,29 @@ export default function RootLayout({
 }) {
   return (
     <html lang="ko">
-      <body className="bg-bg text-fg min-h-dvh">{children}</body>
+      <body className="bg-bg text-fg min-h-dvh">
+        {children}
+        {/*
+         * Fixed bottom tab bar (홈 / 그룹 / 설정), mounted here because the root
+         * layout is the only node that survives every navigation -- putting it
+         * inside a page would remount and re-animate it on each route change.
+         *
+         * It renders AFTER {children} so the DOM order matches the reading
+         * order: page content first, then the navigation landmark.
+         *
+         * BottomNav returns null on /login, /install, /onboarding and /auth --
+         * pre-membership screens where two of its three tabs would dead-end --
+         * so it is safe to mount unconditionally from here.
+         *
+         * The bar is `fixed`, so it does not reserve space. Each page has to
+         * clear it itself; app/page.tsx does that with a spacer at the end of
+         * its <main>. No padding is added to <body> on purpose: it would also
+         * apply on the screens where the bar is hidden, and combined with the
+         * `screen-safe` (min-height:100dvh) wrapper those pages use it would
+         * push every one of them into a pointless 7rem scroll.
+         */}
+        <BottomNav />
+      </body>
     </html>
   )
 }

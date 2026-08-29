@@ -20,8 +20,16 @@ import type { Database } from '@/lib/supabase/types'
  * RLS is the real backstop.
  */
 
-/** Path prefixes reachable without a session. */
-const PUBLIC_PREFIXES = ['/login', '/auth'] as const
+/**
+ * Path prefixes reachable without a session.
+ *
+ * `/install` is public on purpose: it is a static Home Screen guide with no user
+ * data, and an iPhone visitor needs to be able to read it BEFORE signing in.
+ * Push only works from the installed app, so gating the install instructions
+ * behind login would put the one thing they must do first behind the thing it
+ * is a prerequisite for.
+ */
+const PUBLIC_PREFIXES = ['/login', '/auth', '/install'] as const
 
 function isPublicPath(pathname: string): boolean {
   return PUBLIC_PREFIXES.some(

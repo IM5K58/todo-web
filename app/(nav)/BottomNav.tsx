@@ -4,7 +4,7 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 
 /**
- * Fixed bottom navigation: 홈 / 그룹 / 설정.
+ * Fixed bottom navigation: 홈 / 현황 / 그룹 / 설정.
  *
  * NOT wired into app/layout.tsx from here — the "home" agent owns that file.
  * To mount it, render <BottomNav /> after {children} inside <body>, and give
@@ -12,12 +12,16 @@ import { usePathname } from 'next/navigation'
  * iOS home-indicator inset, so `pb-28` on the page <main> is the safe amount).
  *
  * Deliberately hidden on /login, /install, and /onboarding: those are all
- * pre-membership screens where two of the three tabs would either bounce the
- * user to a redirect or dead-end on an empty group list.
+ * pre-membership screens where the tabs would either bounce the user to a
+ * redirect or dead-end on an empty group list.
+ *
+ * Four tabs at max-w-md is 96px each — still well over the 44px touch minimum,
+ * so the labels stay rather than being traded for icon-only tabs.
  */
 
 const TABS = [
   { href: '/', label: '홈', icon: HomeIcon },
+  { href: '/status', label: '현황', icon: ChartIcon },
   { href: '/groups', label: '그룹', icon: GroupIcon },
   { href: '/settings', label: '설정', icon: BellIcon },
 ] as const
@@ -85,6 +89,18 @@ function HomeIcon() {
     <svg {...ICON_PROPS}>
       <path d="M3 10.5 12 3l9 7.5" />
       <path d="M5.5 9.5V20h13V9.5" />
+    </svg>
+  )
+}
+
+/** 현황 — three bars of different heights, i.e. everyone's progress. */
+function ChartIcon() {
+  return (
+    <svg {...ICON_PROPS}>
+      <path d="M6 20v-6.5" />
+      <path d="M12 20V7" />
+      <path d="M18 20v-9.5" />
+      <path d="M3.5 20h17" />
     </svg>
   )
 }

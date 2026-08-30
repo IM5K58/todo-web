@@ -463,3 +463,316 @@ export function ConfirmButton({
     </div>
   )
 }
+
+// ---------------------------------------------------------------------------
+// Task checkbox  (Phase 2 — /)
+// ---------------------------------------------------------------------------
+
+/** The tick inside a checked box. Sized to the box, inherits currentColor. */
+function CheckIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="3"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M5 12.5 10 17.5 19 7" />
+    </svg>
+  )
+}
+
+export interface TaskCheckboxProps {
+  /** Current stored state. Pass the optimistic value if the caller keeps one. */
+  checked: boolean
+  /**
+   * The task text. Rendered inside the button so the whole row is one tap
+   * target, and struck through when checked.
+   */
+  children?: ReactNode
+  /** Accessible name when there is no `children` (icon-only usage). */
+  label?: string
+  /** Forwarded to the submit button, so one <form> can serve several rows. */
+  name?: string
+  value?: string
+  disabled?: boolean
+  /**
+   * Force the pending look. Leave it off inside a Server Action <form>: the
+   * component reads useFormStatus() exactly like Button does.
+   */
+  pending?: boolean
+  className?: string
+}
+
+/**
+ * A checkbox that is really a submit button.
+ *
+ * It has to live inside a Server Action <form> — that is the whole point: no
+ * onChange handler, no client fetch, and useFormStatus() gives an honest
+ * pending state for free. `role="checkbox"` + `aria-checked` keeps the
+ * semantics a screen reader expects even though the element is a <button>.
+ *
+ * Touch target: the button is min-h-11 (44px, the iOS minimum) and full width,
+ * so the label text is part of the tap area rather than a 24px bullseye.
+ *
+ * While pending the row dims and the box shows a spinner ring, and the button
+ * disables itself so a double-tap cannot fire two toggles at the same row.
+ */
+export function TaskCheckbox({
+  checked,
+  children,
+  label,
+  name,
+  value,
+  disabled,
+  pending,
+  className = '',
+}: TaskCheckboxProps) {
+  const status = useFormStatus()
+  const isPending = pending ?? status.pending
+
+  return (
+    <button
+      type="submit"
+      role="checkbox"
+      aria-checked={checked}
+      aria-label={children ? undefined : label}
+      aria-busy={isPending || undefined}
+      name={name}
+      value={value}
+      disabled={disabled || isPending}
+      className={`flex min-h-11 w-full items-center gap-3 rounded-xl px-1 py-2 text-left transition active:scale-[0.99] disabled:pointer-events-none ${
+        isPending ? 'opacity-60' : ''
+      } ${className}`}
+    >
+      <span
+        aria-hidden="true"
+        className={`grid size-6 shrink-0 place-items-center rounded-md border transition ${
+          checked ? 'border-accent bg-accent text-accent-fg' : 'border-line bg-surface-2'
+        }`}
+      >
+        {isPending ? (
+          // A ring, not a tick: the toggle has not landed yet, so showing the
+          // new state here would be a lie the server might not agree with.
+          <span
+            className={`size-3 animate-spin rounded-full border-2 border-current border-t-transparent ${
+              checked ? 'text-accent-fg' : 'text-muted'
+            }`}
+          />
+        ) : checked ? (
+          <CheckIcon />
+        ) : null}
+      </span>
+
+      {children && (
+        <span
+          className={`min-w-0 flex-1 text-base leading-snug [word-break:keep-all] ${
+            checked ? 'text-muted line-through' : 'text-fg'
+          }`}
+        >
+          {children}
+        </span>
+      )}
+    </button>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Progress
+// ---------------------------------------------------------------------------
+
+export interface ProgressBarProps {
+  /** Completed count. Clamped into 0..max, so a stale count cannot overflow. */
+  value: number
+  /** Total count. `0` renders an inert empty track (nothing to measure yet). */
+  max: number
+  /** Accessible name, e.g. '민수님의 오늘 진행 상황'. */
+  label?: string
+  className?: string
+}
+
+/**
+ * A determinate progress bar.
+ *
+ * Colour carries the "done" state: a partly-filled bar is a softened accent,
+ * a full one is the solid accent — enough to pick the finished members out of
+ * a list at a glance without inventing a colour the theme does not have.
+ *
+ * The only animation is the width transition, and app/globals.css already
+ * neutralises it under prefers-reduced-motion.
+ */
+export function ProgressBar({ value, max, label, className = '' }: ProgressBarProps) {
+  const safeMax = Number.isFinite(max) && max > 0 ? Math.floor(max) : 0
+  const safeValue =
+    safeMax === 0 ? 0 : Math.min(Math.max(Math.floor(value) || 0, 0), safeMax)
+  const percent = safeMax === 0 ? 0 : (safeValue / safeMax) * 100
+  const complete = safeMax > 0 && safeValue === safeMax
+
+  const track = `bg-surface-2 h-2 w-full overflow-hidden rounded-full ${className}`
+
+  // max = 0 means "no tasks yet". A progressbar of 0 out of 0 is meaningless to
+  // announce, so the track stays decorative and the caller says why in text.
+  if (safeMax === 0) {
+    return <div aria-hidden="true" className={track} />
+  }
+
+  return (
+    <div
+      role="progressbar"
+      aria-valuemin={0}
+      aria-valuemax={safeMax}
+      aria-valuenow={safeValue}
+      aria-valuetext={`${safeMax}개 중 ${safeValue}개 완료`}
+      aria-label={label}
+      className={track}
+    >
+      <div
+        className={`h-full rounded-full transition-[width] duration-300 ${
+          complete ? 'bg-accent' : 'bg-accent/60'
+        }`}
+        style={{ width: `${percent}%` }}
+      />
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Streak
+// ---------------------------------------------------------------------------
+
+export interface StreakBadgeProps {
+  /** Consecutive days. Anything ≤ 0 (or NaN) is treated as "no streak yet". */
+  days: number
+  /**
+   * Render nothing at 0 instead of the invitation pill. Use it where a second
+   * line of encouragement would just be noise (inside a dense list row).
+   */
+  hideWhenZero?: boolean
+  className?: string
+}
+
+/**
+ * 연속 일수.
+ *
+ * At 0 this deliberately does NOT disappear by default: a brand-new user
+ * staring at a blank home screen gets 오늘부터 시작해요 instead of nothing,
+ * and it is still the truth — no fabricated number. Pass hideWhenZero where
+ * that invitation does not fit.
+ */
+export function StreakBadge({ days, hideWhenZero = false, className = '' }: StreakBadgeProps) {
+  const safeDays = Number.isFinite(days) && days > 0 ? Math.floor(days) : 0
+
+  if (safeDays === 0 && hideWhenZero) return null
+
+  const base =
+    'inline-flex h-7 shrink-0 items-center gap-1 rounded-full px-3 text-xs font-medium'
+
+  if (safeDays === 0) {
+    return (
+      <span className={`bg-surface-2 text-muted ${base} ${className}`}>
+        <span aria-hidden="true">🌱</span>
+        오늘부터 시작해요
+      </span>
+    )
+  }
+
+  return (
+    <span className={`bg-accent text-accent-fg ${base} ${className}`}>
+      <span aria-hidden="true">🔥</span>
+      {safeDays}일 연속
+    </span>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Member progress row  (Phase 2 — /status)
+// ---------------------------------------------------------------------------
+
+export interface MemberProgressRowProps {
+  /** Avatar emoji from profiles.avatar_emoji. Falls back to 🙂. */
+  emoji?: ReactNode
+  name: string
+  isSelf?: boolean
+  /** Completed / total tasks for that member today. */
+  done: number
+  total: number
+  /** Where 콕 찌르기 goes. Give it a `sm` Button so it stays a 44px target. */
+  action?: ReactNode
+  /** Replaces the default copy shown when `total` is 0. */
+  note?: ReactNode
+}
+
+/**
+ * One member on the 현황 screen.
+ *
+ * ListRow is not enough here: its subtitle is a single truncating <p>, and a
+ * progress bar plus an n/m counter cannot live inside that. Everything else —
+ * the 40px emoji circle, the min-h-14 row, the bottom divider — is copied from
+ * ListRow so the two read as the same list.
+ *
+ * Divider caveat, same as ListRow: if you wrap each row in an <li>, the row is
+ * always its <li>'s last child so `last:border-b-0` never fires. Put the border
+ * on the <li> in that case (see app/groups/page.tsx), or render rows as
+ * siblings inside one <div>.
+ */
+export function MemberProgressRow({
+  emoji,
+  name,
+  isSelf = false,
+  done,
+  total,
+  action,
+  note,
+}: MemberProgressRowProps) {
+  const safeTotal = Number.isFinite(total) && total > 0 ? Math.floor(total) : 0
+  const safeDone =
+    safeTotal === 0 ? 0 : Math.min(Math.max(Math.floor(done) || 0, 0), safeTotal)
+  const complete = safeTotal > 0 && safeDone === safeTotal
+
+  return (
+    <div className="border-line flex min-h-14 items-center gap-3 border-b py-3 last:border-b-0">
+      <div
+        aria-hidden="true"
+        className="bg-surface-2 grid size-10 shrink-0 place-items-center rounded-full text-lg"
+      >
+        {emoji ?? '🙂'}
+      </div>
+
+      <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+        <p className="text-fg truncate text-sm font-medium">
+          {name}
+          {isSelf && <span className="text-muted font-normal"> (나)</span>}
+        </p>
+
+        {safeTotal === 0 ? (
+          <p className="text-muted text-xs [word-break:keep-all]">
+            {note ?? '아직 오늘 할 일을 적지 않았어요.'}
+          </p>
+        ) : (
+          <div className="flex items-center gap-2">
+            <ProgressBar
+              value={safeDone}
+              max={safeTotal}
+              label={`${name}님의 오늘 진행 상황`}
+              className="min-w-0 flex-1"
+            />
+            <span
+              className={`shrink-0 text-xs tabular-nums ${
+                complete ? 'text-accent font-medium' : 'text-muted'
+              }`}
+            >
+              {safeDone}/{safeTotal}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {action && <div className="shrink-0">{action}</div>}
+    </div>
+  )
+}

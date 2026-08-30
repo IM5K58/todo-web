@@ -1,28 +1,48 @@
 import { redirect } from 'next/navigation'
 
-import { Card, EmptyState, Hint, LinkButton } from '@/components/ui'
+import { Card, EmptyState, ErrorText, Hint, LinkButton } from '@/components/ui'
+import { STREAK_WINDOW_DAYS, getTodayPageData } from '@/lib/tasks'
 import { createClient } from '@/lib/supabase/server'
 
+import TodayTasks, { type TodayTaskView } from './today-tasks'
+
 /**
- * "오늘" 홈 화면 — Phase 1.
+ * "오늘" 홈 화면 — Phase 2.
  *
  * `/` is the manifest start_url + scope, the post-login redirect target, and
  * the URL every push payload opens, so this file has to exist and has to be
- * cheap. Task CRUD is deliberately NOT here (Phase 2) and is NOT faked.
+ * cheap. Phase 1 left a placeholder here; the task list is now real.
  *
- * Server Component: it reads cookies through createClient(), which makes the
- * route dynamic automatically — no `export const dynamic` needed.
+ * Server Component. Every read goes through lib/tasks.ts, which is the module
+ * /status shares — so the two screens can never disagree about what "today"
+ * is or how a streak is counted. Only <TodayTasks> ships JS, because it is the
+ * only part that needs local state (optimistic checks, and a text field that
+ * has to keep focus between entries).
  *
  * The honest states, in this order:
  *   1. 로그인 안 됨          -> redirect('/login')
  *   2. 읽기 실패             -> 실패했다고 말하기 (빈 화면으로 삼키지 않기)
  *   3. 프로필이 아직 기본값   -> /onboarding 으로 유도하는 카드를 맨 위에
  *   4. 그룹 없음             -> /groups/new · /groups/join 빈 상태
- *   5. 그룹 있음             -> 그룹 이름 · 내 이름 · 오늘 날짜 + Phase 2 안내
+ *   5. 그룹 있음             -> 날짜 · 이름 · 스트릭 + 진행 요약 + 할 일 목록
  *
  * State 3 is a BANNER, not a wall. A hard branch would lock anyone who
  * genuinely wants to stay '친구' 🙂 out of their own home screen forever, since
  * there is nowhere to record "I already declined".
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT "TODAY" MEANS HERE, AND WHY IT IS NOT COMPUTED IN JAVASCRIPT
+ * ---------------------------------------------------------------------------
+ * `tasks.task_date` DEFAULTs to `public.current_user_local_date()` — today in
+ * the user's *profile* timezone. `getTodayPageData()` filters on the value that
+ * same function returns, over rpc(). If this screen decided "today" on its own
+ * and the two ever disagreed, a task written at 00:30 KST would be filed under
+ * a date the list never queries and it would look like the app lost it.
+ *
+ * So the header formats `data.today` — the exact string the query filtered on —
+ * rather than formatting `new Date()` a second time. The profile timezone is
+ * only shown as a footnote. `new Date().toISOString().slice(0, 10)` appears
+ * nowhere: it is UTC, and returns yesterday for the whole Korean night.
  */
 
 // ---------------------------------------------------------------------------
@@ -43,35 +63,29 @@ const DEFAULT_AVATAR_EMOJI = '🙂'
 
 /**
  * Mirrors `public.current_user_local_date()`'s fallback exactly (0001_init.sql
- * §3): an unknown zone falls back to Asia/Seoul rather than throwing. That
- * function is the DEFAULT for `tasks.task_date`, so if this header and the
- * database disagreed about "today", a task filed at 00:30 KST would land under
- * a date the screen never showed.
+ * §3): an unknown zone falls back to Asia/Seoul rather than throwing.
  */
 const FALLBACK_TIMEZONE = 'Asia/Seoul'
 
-/** "2026년 8월 30일 토요일" in the user's own timezone. */
-function formatToday(timeZone: string): string {
-  const options: Intl.DateTimeFormatOptions = {
-    timeZone,
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+/**
+ * "2026년 8월 30일 토요일" from a 'YYYY-MM-DD' calendar date.
+ *
+ * Formatted at `timeZone: 'UTC'` against a UTC-midnight Date, which is not a
+ * timezone assumption but the opposite of one: the input is already a plain
+ * calendar date with no instant attached, and pinning both ends to UTC is the
+ * only way to render it without a zone shifting it a day either way.
+ */
+function formatKoreanDate(isoDate: string): string {
+  const [year, month, day] = isoDate.split('-').map(Number)
+  return new Intl.DateTimeFormat('ko-KR', {
+    timeZone: 'UTC',
     year: 'numeric',
     month: 'long',
     day: 'numeric',
     weekday: 'long',
-  }
-
-  try {
-    return new Intl.DateTimeFormat('ko-KR', options).format(new Date())
-  } catch {
-    // The `profiles_validate_timezone` trigger checks the value against
-    // pg_timezone_names on write, but Node's ICU tables and Postgres's are not
-    // the same vintage, so a zone that is valid in the database can still throw
-    // here. Falling back beats a 500 on the app's start_url.
-    return new Intl.DateTimeFormat('ko-KR', {
-      ...options,
-      timeZone: FALLBACK_TIMEZONE,
-    }).format(new Date())
-  }
+  }).format(new Date(Date.UTC(year, month - 1, day)))
 }
 
 // ---------------------------------------------------------------------------
@@ -86,13 +100,14 @@ function formatToday(timeZone: string): string {
  * `screen-safe` already sets `padding-bottom: env(safe-area-inset-bottom)` and
  * which of the two utilities wins the cascade is not something to leave to
  * chance -- if `screen-safe` won, the last row of content would sit under a
- * 56px bar. A sibling <div> has no such ambiguity.
+ * 56px bar. A sibling <div> has no such ambiguity. `h-28` is the same 7rem the
+ * bar's own note asks for (56px bar + home-indicator inset + breathing room).
  */
 function Screen({ children }: { children: React.ReactNode }) {
   return (
     <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
       {children}
-      <div aria-hidden="true" className="h-20 shrink-0" />
+      <div aria-hidden="true" className="h-28 shrink-0" />
     </main>
   )
 }
@@ -177,11 +192,11 @@ export default async function TodayPage() {
   const { data: claimsData, error: claimsError } = await supabase.auth.getClaims()
   const userId = claimsData?.claims.sub
 
-  if (claimsError || !userId) {
+  if (claimsError || typeof userId !== 'string' || !userId) {
     redirect('/login')
   }
 
-  const [profileResult, membershipResult] = await Promise.all([
+  const [profileResult, data] = await Promise.all([
     // NEVER .select('*') here. Migration 0003 narrowed the profiles SELECT
     // grant to (id, display_name, avatar_emoji, timezone, created_at), so '*'
     // reaches for the auto_nudge_* columns and comes back 42501.
@@ -190,16 +205,20 @@ export default async function TodayPage() {
       .select('display_name, avatar_emoji, timezone')
       .eq('id', userId)
       .maybeSingle(),
-    supabase
-      .from('group_members')
-      .select('group_id, joined_at')
-      .eq('user_id', userId)
-      // Deterministic "primary group" for anyone who is in more than one.
-      .order('joined_at', { ascending: true }),
+    // Groups + today's tasks + streak, all against the database's own idea of
+    // "today". Never throws; a failure arrives as `data.error` in Korean.
+    getTodayPageData(),
   ])
 
-  if (profileResult.error || membershipResult.error) {
+  if (profileResult.error) {
     return <LoadError message={READ_FAILED_KO} />
+  }
+
+  // The loader re-verifies the session independently. Losing it between the two
+  // calls is rare but real (a token that expired mid-request), and rendering a
+  // logged-out shell would be worse than bouncing to /login.
+  if (!data.userId) {
+    redirect('/login')
   }
 
   const profile = profileResult.data
@@ -215,67 +234,111 @@ export default async function TodayPage() {
     !profile ||
     (displayName === DEFAULT_DISPLAY_NAME && avatarEmoji === DEFAULT_AVATAR_EMOJI)
 
-  const groupIds = (membershipResult.data ?? []).map((row) => row.group_id)
-  if (groupIds.length === 0) {
+  // `getMyGroups` returns an EMPTY list on failure, so "no groups" and "the
+  // group read failed" arrive looking identical. The error field is what tells
+  // them apart, and showing 그룹 만들기 to someone who already has a group would
+  // send them off to create a duplicate.
+  if (data.groups.length === 0) {
+    if (data.error) {
+      return <LoadError message={data.error} />
+    }
     return <NoGroupState needsOnboarding={needsOnboarding} />
   }
 
-  // Name the columns. `.select('*')` on public.groups trips the column-level
-  // grant that hides `invite_code` and fails with "permission denied for column
-  // invite_code" — the code is readable ONLY through rpc('get_invite_code'),
-  // and only by the owner.
-  const { data: groups, error: groupsError } = await supabase
-    .from('groups')
-    .select('id, name, created_by, created_at')
-    .in('id', groupIds)
-
-  if (groupsError) {
+  const activeGroup = data.activeGroup
+  if (!activeGroup) {
     return <LoadError message={READ_FAILED_KO} />
   }
 
-  // `.in()` does not preserve the order of `groupIds`, so re-sort by join order
-  // instead of trusting whatever PostgREST happened to return first.
-  const byId = new Map((groups ?? []).map((group) => [group.id, group]))
-  const primaryGroup = groupIds.map((id) => byId.get(id)).find((group) => group != null)
+  const otherGroupCount = data.groups.length - 1
 
-  // `groups_select_members` lets any member read their own groups row, so an
-  // empty result when a membership exists is a failed read, not "no groups".
-  if (!primaryGroup) {
-    return <LoadError message={READ_FAILED_KO} />
-  }
+  // At this point the groups read succeeded, so any remaining error came from
+  // the task or streak query. That is survivable: the header, the profile nudge
+  // and the links are all still true and still useful. Rendering an empty list
+  // instead would claim the user wrote nothing today — a different, wrong thing.
+  const tasksFailed = Boolean(data.error)
 
-  const otherGroupCount = groupIds.length - 1
+  const todayTasks: TodayTaskView[] = data.tasks.map((task) => ({
+    id: task.id,
+    title: task.title,
+    done: task.done_at !== null,
+  }))
+
+  const headerDate = ISO_DATE_RE.test(data.today)
+    ? formatKoreanDate(data.today)
+    // The loader falls back to an Intl-derived date and only returns '' before
+    // a session exists, which we already handled above. Belt and braces.
+    : formatKoreanDate(
+        new Intl.DateTimeFormat('en-CA', {
+          timeZone: FALLBACK_TIMEZONE,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+        }).format(new Date()),
+      )
 
   return (
     <Screen>
+      {/* ---- 헤더 ------------------------------------------------------ */}
       <header className="flex flex-col gap-1">
         <p className="text-muted truncate text-sm">
-          {primaryGroup.name}
+          {activeGroup.name}
           {otherGroupCount > 0 ? ` 외 ${otherGroupCount}개` : ''}
         </p>
-        <h1 className="text-fg text-2xl font-semibold tracking-tight">
-          <span aria-hidden="true">{avatarEmoji}</span> {displayName}님의 오늘
-        </h1>
-        <p className="text-muted text-sm tabular-nums">{formatToday(timeZone)}</p>
+
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <h1 className="text-fg text-2xl font-semibold tracking-tight">
+            <span aria-hidden="true">{avatarEmoji}</span> {displayName}님의 오늘
+          </h1>
+          {/* Hidden while the task read is broken: a streak of 0 next to a
+              "불러오지 못했어요" card reads as "you lost your streak". */}
+          {!tasksFailed && data.streak > 0 && (
+            <span
+              className="border-line bg-surface-2 text-fg inline-flex h-7 shrink-0 items-center rounded-full border px-3 text-xs font-medium"
+              title="적은 할 일을 그날 안에 모두 끝낸 날이 며칠 연속인지예요. 오늘이 아직 안 끝났어도 줄어들지 않아요."
+            >
+              <span aria-hidden="true">🔥</span>
+              <span className="ml-1 tabular-nums">
+                {data.streak}일 연속
+                {data.streak >= STREAK_WINDOW_DAYS ? '+' : ''}
+              </span>
+            </span>
+          )}
+        </div>
+
+        <p className="text-muted text-sm tabular-nums">{headerDate}</p>
       </header>
 
       {needsOnboarding && <OnboardingNudge />}
 
-      <Card>
-        <p className="text-muted text-xs font-medium tracking-wide">준비 중</p>
-        <h2 className="text-fg text-base font-semibold">할 일 기능은 다음 단계예요</h2>
-        <Hint>
-          할 일 적기·완료 체크·친구 콕 찌르기는 아직 붙지 않았어요. 지금은 로그인,
-          그룹, 알림 설정까지 동작합니다. 보여줄 진짜 할 일이 생기기 전까지는 비워둘게요.
-        </Hint>
-      </Card>
+      {/* ---- 오늘 할 일 ------------------------------------------------ */}
+      {tasksFailed ? (
+        <Card title="할 일을 불러오지 못했어요">
+          <ErrorText>{data.error}</ErrorText>
+          <Hint>아직 아무것도 지워지지 않았어요. 다시 불러오면 그대로 보일 거예요.</Hint>
+          {/* Same reasoning as LoadError: a soft navigation to '/' could be
+              served from the router cache without re-running the query. */}
+          <a
+            href="/"
+            className="border-line bg-surface text-fg inline-flex h-12 w-full shrink-0 items-center justify-center rounded-xl border px-4 text-base font-medium transition active:scale-[0.99]"
+          >
+            다시 불러오기
+          </a>
+        </Card>
+      ) : (
+        <TodayTasks
+          tasks={todayTasks}
+          groupId={activeGroup.id}
+          groupName={activeGroup.name}
+          showGroupHint={otherGroupCount > 0}
+        />
+      )}
 
+      {/* ---- 이동 ------------------------------------------------------ */}
       <div className="flex flex-col gap-3">
+        <LinkButton href="/status">친구들 현황 보기</LinkButton>
         <LinkButton href="/groups" variant="secondary">
-          내 그룹 보기
-        </LinkButton>
-        <LinkButton href="/settings" variant="secondary">
-          알림 설정
+          내 그룹 관리
         </LinkButton>
       </div>
 

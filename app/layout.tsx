@@ -1,5 +1,7 @@
 import type { Metadata, Viewport } from 'next'
 
+import { SerwistProvider } from '@serwist/turbopack/react'
+
 import BottomNav from '@/app/(nav)/BottomNav'
 
 import './globals.css'
@@ -72,6 +74,23 @@ export default function RootLayout({
   return (
     <html lang="ko">
       <body className="bg-bg text-fg min-h-dvh">
+        {/*
+         * 서비스워커 등록. 이게 없으면 워커가 영영 등록되지 않고,
+         * 그 결과 (a) 크롬/안드로이드 설치 배너가 뜨지 않으며
+         * (b) lib/push/subscribe.ts 의 navigator.serviceWorker.ready 가
+         * 영원히 대기해서 푸시 알림이 통째로 죽는다.
+         *
+         * @serwist/next(webpack) 는 등록 스크립트를 자동 주입해주지만
+         * 우리가 쓰는 @serwist/turbopack 은 하지 않는다. 대신 이 프로바이더를
+         * 제공한다. 내부에서 window.serwist.register() 를 호출한다.
+         *
+         * swUrl 이 루트가 아니라 /serwist/ 아래인 이유는 Turbopack 에
+         * 플러그인 API 가 없어 워커를 Route Handler 로 서빙하기 때문이다.
+         * 그 핸들러가 Service-Worker-Allowed: / 를 붙여주므로 scope 를
+         * '/' 로 명시해야 워커가 사이트 전체를 제어한다. 생략하면 스코프가
+         * /serwist/ 로 좁아져 아무 페이지도 제어하지 못한다.
+         */}
+        <SerwistProvider swUrl="/serwist/sw.js" options={{ scope: '/' }}>
         {children}
         {/*
          * Fixed bottom tab bar (홈 / 그룹 / 설정), mounted here because the root
@@ -92,7 +111,8 @@ export default function RootLayout({
          * `screen-safe` (min-height:100dvh) wrapper those pages use it would
          * push every one of them into a pointless 7rem scroll.
          */}
-        <BottomNav />
+          <BottomNav />
+        </SerwistProvider>
       </body>
     </html>
   )

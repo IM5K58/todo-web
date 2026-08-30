@@ -522,8 +522,12 @@ export async function getStatusPageData(
     return { ...empty, error: '로그인이 필요합니다.' }
   }
 
-  const today = await getLocalToday()
-  const { groups, error: groupError } = await getMyGroups(userId)
+  // 이 둘은 서로 의존하지 않는다. 순차로 await 하면 화면이 뜨기까지
+  // 왕복이 한 번 더 늘어난다 (탭 전환 때 체감되는 지연).
+  const [today, { groups, error: groupError }] = await Promise.all([
+    getLocalToday(),
+    getMyGroups(userId),
+  ])
 
   if (groupError) {
     return { ...empty, userId, today, error: groupError }

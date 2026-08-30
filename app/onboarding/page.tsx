@@ -210,6 +210,10 @@ export default async function OnboardingPage({
           ? '저장하면 그룹 만들기로 이어져요. 이미 초대 코드를 받았다면 그 다음 화면에서 참여할 수 있어요.'
           : '저장하면 오늘 화면으로 돌아가요.'}
       </Hint>
+      {/* 하단 고정 탭바(56px + safe-area) 가림 방지. screen-safe 가
+          min-height:100dvh 라서 pb-28 을 쓰면 내용이 짧아도 무의미한
+          스크롤이 생긴다. 그래서 패딩이 아니라 스페이서. */}
+      <div aria-hidden="true" className="h-28 shrink-0" />
     </main>
   )
 }

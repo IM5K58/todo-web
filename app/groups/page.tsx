@@ -436,6 +436,10 @@ export default async function GroupsPage({
           초대 코드로 참여하기
         </LinkButton>
       </Card>
+      {/* 하단 고정 탭바(56px + safe-area) 가림 방지. screen-safe 가
+          min-height:100dvh 라서 pb-28 을 쓰면 내용이 짧아도 무의미한
+          스크롤이 생긴다. 그래서 패딩이 아니라 스페이서. */}
+      <div aria-hidden="true" className="h-28 shrink-0" />
     </main>
   )
 }
@@ -458,6 +462,10 @@ function LoadFailure({ message }: { message: string }) {
           다시 불러오기
         </LinkButton>
       </Card>
+      {/* 하단 고정 탭바(56px + safe-area) 가림 방지. screen-safe 가
+          min-height:100dvh 라서 pb-28 을 쓰면 내용이 짧아도 무의미한
+          스크롤이 생긴다. 그래서 패딩이 아니라 스페이서. */}
+      <div aria-hidden="true" className="h-28 shrink-0" />
     </main>
   )
 }

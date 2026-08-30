@@ -16,8 +16,32 @@ import type { Database } from '@/lib/supabase/types'
  * SCOPE: this layer is for session refresh and UX redirects. It is NOT the
  * authorization boundary. Next middleware has a documented bypass class
  * (CVE-2025-29927), so every protected layout and every /api route handler
- * must independently call `supabase.auth.getUser()` and reject on failure.
- * RLS is the real backstop.
+ * must independently call `supabase.auth.getClaims()` (or `getUser()`) and
+ * reject on failure. RLS is the real backstop.
+ *
+ * ---------------------------------------------------------------------------
+ * YES, THE SESSION IS CHECKED MORE THAN ONCE PER PAGE REQUEST. THAT IS FINE.
+ * ---------------------------------------------------------------------------
+ * A GET / does the check three times: here, then again in `app/page.tsx`, then
+ * again inside `getTodayPageData()` -> `getSessionUserId()`. The duplication is
+ * deliberate (see SCOPE above -- this file cannot be the boundary) and, since
+ * lib/tasks.ts stopped using `getUser()`, it is also nearly free:
+ *
+ *   - `getClaims()` verifies the JWT locally with WebCrypto. The JWKS it needs
+ *     lives in auth-js's module-level `GLOBAL_JWKS` (GoTrueClient.js:49) with a
+ *     10-minute TTL (lib/constants.js:51). The cache is keyed by storage key,
+ *     NOT by client instance, so the per-request clients that `createClient()`
+ *     mints all share it. Cost after the first call in a warm process: no
+ *     network, just a signature verification.
+ *   - `getUser()` has no such cache. It is a network round-trip to
+ *     /auth/v1/user EVERY time. That is why `getSessionUserId()` in
+ *     lib/tasks.ts was converted to `getClaims()`: it was the one caller in the
+ *     repo still paying that toll, on the two hottest screens.
+ *
+ * So do NOT "optimise" the duplication away by trusting this layer, and do NOT
+ * remove the refresh below. Without the refresh the access token expires and
+ * users get logged out at random -- that is what this hook is FOR. If a check
+ * ever needs to get cheaper, make it `getClaims()`; do not delete it.
  */
 
 /**

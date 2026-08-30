@@ -1,3 +1,4 @@
+import Link from 'next/link'
 import { redirect } from 'next/navigation'
 
 import { Card, EmptyState, ErrorText, Hint, LinkButton } from '@/components/ui'
@@ -306,7 +307,24 @@ export default async function TodayPage() {
           )}
         </div>
 
-        <p className="text-muted text-sm tabular-nums">{headerDate}</p>
+        {/*
+          날짜 줄 오른쪽에 기록 화면 링크. 스트릭 배지 바로 아래이면서, 배지
+          자체(h-7)를 탭 대상으로 만들지 않는 자리입니다 -- 28px 은 44px 최소
+          터치 목표에 못 미칩니다. 여기 링크는 h-11 이고, -my-2 로 날짜 줄의
+          시각적 높이는 그대로 둡니다.
+
+          하단 탭바에 5번째 탭을 만들지 않은 이유: 기록은 매일 여는 화면이
+          아니고, 375px 에서 5탭이면 한 칸이 75px 로 좁아집니다.
+        */}
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-muted text-sm tabular-nums">{headerDate}</p>
+          <Link
+            href="/history"
+            className="text-muted -my-2 inline-flex h-11 shrink-0 items-center gap-1 text-sm underline-offset-4 hover:underline"
+          >
+            기록 보기 <span aria-hidden="true">→</span>
+          </Link>
+        </div>
       </header>
 
       {needsOnboarding && <OnboardingNudge />}

@@ -28,6 +28,28 @@
  * 4. 조회 함수는 예외를 던지지 않습니다.
  *    페이지 로더(get*PageData)는 { error: string | null, ... } 를 돌려주고,
  *    화면이 한국어 오류를 정직하게 렌더링합니다. 조용한 무시는 하지 않습니다.
+ *
+ * 5. 왕복은 세어서 관리합니다. 추측이 아니라 측정값이 근거입니다.
+ *    Vercel 함수 → Supabase 왕복 1회 = 261~1431ms (대개 ~700ms). 내 PC(한국)
+ *    에서 같은 DB 는 ~50ms 입니다. 차이는 무료 플랜 함수의 기본 리전이 미국
+ *    이었기 때문이고 vercel.json 의 "regions": ["icn1"] 로 고정했지만, 그래도
+ *    왕복 1회는 공짜가 아닙니다. 그래서 아래 두 가지를 구분해서 셉니다.
+ *      · 질의 수      = Supabase 로 나가는 요청의 총 개수
+ *      · 순차 왕복 수 = 서로 기다리는 "파(wave)"의 개수 = 실제 벽시계 지연
+ *    병렬로 띄운 두 질의는 질의 2회지만 파는 1개입니다.
+ *
+ *    ┌──────────────────┬───────────────┬───────────────┐
+ *    │                  │ 변경 전       │ 변경 후       │
+ *    ├──────────────────┼───────────────┼───────────────┤
+ *    │ getTodayPageData │ 파 4 / 질의 6 │ 파 2 / 질의 4 │
+ *    │ getStatusPageData│ 파 6 / 질의 7 │ 파 4 / 질의 6 │
+ *    └──────────────────┴───────────────┴───────────────┘
+ *    (변경 후의 "파" 는 auth.getClaims() 가 JWKS 캐시에 적중한 경우입니다.
+ *     캐시가 비어 있는 콜드 스타트에서는 각각 +1 파. 캐시는 프로세스 전역이고
+ *     TTL 10분이라 따뜻한 인스턴스에서는 거의 항상 적중합니다.)
+ *
+ *    새 질의를 추가할 때는 "이게 앞의 결과를 정말 필요로 하는가"를 먼저 물어
+ *    보세요. 아니면 Promise.all 로 같은 파에 넣으세요.
  */
 
 import type { PostgrestError } from '@supabase/supabase-js'
@@ -180,12 +202,35 @@ export const STREAK_WINDOW_DAYS = 120
  * 기본 조회
  * ======================================================================== */
 
-/** 로그인한 사용자 id. 없으면 null. getSession() 은 검증을 안 하므로 쓰지 않습니다. */
+/**
+ * 로그인한 사용자 id. 없으면 null. getSession() 은 검증을 안 하므로 쓰지 않습니다.
+ *
+ * ── 왕복 1회 → 0회 (따뜻한 인스턴스 기준) ────────────────────────────────
+ * 예전에는 auth.getUser() 였습니다. getUser() 는 *언제나* Auth 서버로
+ * GET /auth/v1/user 를 보냅니다 — 캐시가 없습니다(auth-js 2.112.4).
+ *
+ * getClaims() 는 JWT 서명을 WebCrypto 로 로컬 검증합니다. 검증에 필요한
+ * 공개키(JWKS)는 auth-js 의 모듈 전역 GLOBAL_JWKS 에 storageKey 별로 10분
+ * (JWKS_TTL) 캐시됩니다 — createClient() 가 요청마다 새 클라이언트를 만들어도
+ * 캐시는 프로세스가 공유하므로, 람다가 살아 있는 동안은 네트워크가 없습니다.
+ *   node_modules/@supabase/auth-js/dist/main/GoTrueClient.js:49  GLOBAL_JWKS
+ *   node_modules/@supabase/auth-js/dist/main/lib/constants.js:51 JWKS_TTL = 10분
+ *
+ * 대칭키(HS256) 프로젝트라면 getClaims() 가 내부에서 getUser() 로 폴백하므로
+ * 최악의 경우에도 예전과 정확히 같은 비용입니다. 절대 느려지지 않습니다.
+ *
+ * 검증 강도는 그대로입니다. getClaims() 는 서명을 실제로 검증하고(getSession()
+ * 처럼 쿠키를 그대로 되돌려주지 않습니다), 이 프로젝트의 다른 모든 진입점
+ * (proxy.ts, app/page.tsx, app/groups/*, app/api/*) 이 이미 getClaims() 입니다.
+ * 여기만 getUser() 였습니다. 그리고 진짜 방어선은 RLS 입니다.
+ */
 export async function getSessionUserId(): Promise<string | null> {
   const supabase = await createClient()
-  const { data, error } = await supabase.auth.getUser()
-  if (error || !data.user) return null
-  return data.user.id
+  const { data, error } = await supabase.auth.getClaims()
+  if (error) return null
+
+  const sub = data?.claims.sub
+  return typeof sub === 'string' && sub.length > 0 ? sub : null
 }
 
 /**
@@ -193,6 +238,36 @@ export async function getSessionUserId(): Promise<string | null> {
  *
  * tasks.task_date 의 DEFAULT 와 같은 함수를 부르므로, 여기서 얻은 날짜는
  * "방금 INSERT 한 행의 task_date" 와 반드시 일치합니다. JS 로 만들면 어긋납니다.
+ *
+ * ── 검토했고, 바꾸지 않기로 한 것: profiles.timezone + Intl 로 대체 ────────
+ * "profiles.timezone 을 읽어 Intl.DateTimeFormat('en-CA', { timeZone }) 로
+ * JS 에서 만들면 rpc 왕복을 없앨 수 있다"를 실제로 재보고 기각했습니다.
+ *
+ * (1) 왕복이 줄지 않습니다. 이 모듈은 profiles 를 읽지 않습니다. 그러니
+ *     rpc 1회를 profiles SELECT 1회로 바꾸는 1:1 교환일 뿐입니다.
+ *     app/page.tsx 가 profiles(display_name, avatar_emoji, timezone) 를 읽긴
+ *     하지만 그건 제가 소유하지 않은 파일이고, 이미 getTodayPageData() 와
+ *     Promise.all 로 *동시에* 돌고 있어서 벽시계 시간도 0 입니다.
+ *     (정말로 없애려면 페이지가 읽은 timezone 을 로더 인자로 내려보내야 하고,
+ *      그건 export 시그니처 변경입니다 — 금지 사항.)
+ *
+ * (2) 이득이 0인데 새 어긋남이 2종 생깁니다. 0001_init.sql:164~190 의
+ *     current_user_local_date() 는 `(now() at time zone v_tz)::date` 입니다.
+ *     a. 시계 출처가 달라집니다. now() 는 DB 서버 시계, Intl 은 Vercel 함수
+ *        시계입니다. 자정 근처에서 두 시계가 몇백 ms 만 어긋나도 조회 필터와
+ *        INSERT 가 쓴 DEFAULT 가 서로 다른 날짜가 됩니다. 지금은 같은 시계
+ *        하나만 쓰므로 이 어긋남이 원천적으로 불가능합니다.
+ *     b. 시간대 DB 출처가 달라집니다. SQL 쪽 폴백 조건은 "pg_timezone_names
+ *        에 없으면 Asia/Seoul" 이고, JS 쪽 폴백 조건은 "Intl 이 RangeError 를
+ *        던지면" 입니다. 같은 술어가 아닙니다. profiles_validate_timezone
+ *        트리거(0001_init.sql:114~144)는 pg_timezone_names 만 보증하는데,
+ *        거기에는 Intl 이 거부하는 이름('localtime', 'posix/...')이 있습니다.
+ *        그런 값이 저장된 계정은 DB 는 실제 존으로, JS 는 Asia/Seoul 로
+ *        계산하게 됩니다.
+ *
+ * 요약: 왕복 이득 0, 새 실패 모드 2. 그래서 rpc 를 유지합니다. 대신 호출부에서
+ * 이 rpc 가 *다른 질의와 병렬로* 돌게 만들어 벽시계 비용을 없앴습니다
+ * (getTodayPageData / getStatusPageData 주석 참고).
  */
 export async function getLocalToday(): Promise<string> {
   const supabase = await createClient()
@@ -294,12 +369,24 @@ export async function getMyTodayTasks(
 /**
  * 그룹원 전원의 오늘 요약.
  *
- * 질의 2회 (멤버+프로필, 오늘의 tasks). 멤버 수에 비례해 늘지 않습니다.
+ * 질의 3회. 멤버 수에 비례해 늘지 않습니다.
  *   - group_members : 0002 의 group_members_select_same_group 로 같은 그룹만 보임
  *   - profiles      : 0002 의 profiles_select_self_or_groupmate 로 그룹 동료만 보임
  *                     ★ 컬럼 나열 필수 ★ (0003 에서 SELECT 가 컬럼 단위로 축소됨)
  *   - tasks         : 0002 의 tasks_select_group_members 가 같은 그룹 멤버의 행을
  *                     허용하므로 group_id + task_date 한 방으로 전부 가져옵니다.
+ *
+ * ── 순차 왕복 3회 → 2회 (질의 수는 3회 그대로) ────────────────────────────
+ * tasks 질의는 인자(groupId, today)만 쓰고 members 결과에 의존하지 않습니다.
+ * 예전에는 group_members → profiles → tasks 를 줄줄이 await 해서, 멀쩡히
+ * 독립인 tasks 가 앞의 두 개를 기다렸습니다. 이제 tasks 를 group_members 와
+ * 같이 출발시킵니다. profiles 만 userIds 때문에 뒤에 남습니다.
+ * 왕복 1회가 261~1431ms 이므로 /status 가 그만큼 빨라집니다.
+ *
+ * 오류 우선순위는 예전과 글자 그대로 같습니다:
+ *   memberError → (멤버 0명이면 빈 배열) → profileError → taskError.
+ * 달라지는 것은 "멤버 질의가 실패했을 때 tasks 질의도 이미 떠 있다"는 점뿐이고,
+ * 그건 버려집니다(SELECT 라 부작용 없음).
  */
 export async function getGroupTodayStatus(
   groupId: string,
@@ -308,10 +395,17 @@ export async function getGroupTodayStatus(
 ): Promise<{ members: MemberTodayStatus[]; error: string | null }> {
   const supabase = await createClient()
 
-  const { data: members, error: memberError } = await supabase
-    .from('group_members')
-    .select('user_id, role')
-    .eq('group_id', groupId)
+  const [
+    { data: members, error: memberError },
+    { data: taskRows, error: taskError },
+  ] = await Promise.all([
+    supabase.from('group_members').select('user_id, role').eq('group_id', groupId),
+    supabase
+      .from('tasks')
+      .select('user_id, done_at')
+      .eq('group_id', groupId)
+      .eq('task_date', today),
+  ])
 
   if (memberError) {
     return { members: [], error: toKoreanDbError(memberError, '그룹원을 불러오지 못했습니다.') }
@@ -330,12 +424,6 @@ export async function getGroupTodayStatus(
   if (profileError) {
     return { members: [], error: toKoreanDbError(profileError, '프로필을 불러오지 못했습니다.') }
   }
-
-  const { data: taskRows, error: taskError } = await supabase
-    .from('tasks')
-    .select('user_id, done_at')
-    .eq('group_id', groupId)
-    .eq('task_date', today)
 
   if (taskError) {
     return { members: [], error: toKoreanDbError(taskError, '진행 상황을 불러오지 못했습니다.') }
@@ -457,6 +545,61 @@ export async function getMyStreak(
   return { streak: calcStreak(data ?? [], today), error: null }
 }
 
+/**
+ * 오늘 목록 + 스트릭을 질의 **1회**로.
+ *
+ * ── 왕복 2회 → 1회 ───────────────────────────────────────────────────────
+ * getMyTodayTasks 는 `user_id = 나 AND task_date = 오늘`,
+ * getMyStreak 는   `user_id = 나 AND task_date BETWEEN 오늘-120 AND 오늘`.
+ * 뒤엣것이 앞엣것의 **진부분집합이 아니라 초집합**입니다. 같은 테이블, 같은
+ * 정책(tasks_select_own), 같은 인덱스를 두 번 긁을 이유가 없습니다. 창 전체를
+ * 한 번 가져와 메모리에서 오늘 것만 걸러냅니다.
+ *
+ * 두 함수를 지우지 않고 남겨 둔 이유: 둘 다 export 라 lib/history.ts 등
+ * 다른 호출자가 쓸 수 있습니다. 시그니처는 건드리지 않습니다.
+ *
+ * 정렬 주의: sort_order, created_at 순으로 받아옵니다. 날짜로 필터해도 남은
+ * 행들의 상대 순서는 보존되므로 오늘 목록의 순서는 getMyTodayTasks 와 동일합니다.
+ * calcStreak 는 순서를 보지 않습니다(날짜별로 집계만 함).
+ *
+ * 페이로드는 늘어납니다(창 전체 행이 title/id 까지 들고 옴). 3~6명 앱의
+ * 120일치라 수십 KB 수준이고, vercel.json 이 함수를 icn1 로 고정해 DB 와 같은
+ * 리전이라 전송 시간보다 왕복 1회(261~1431ms)가 훨씬 비쌉니다.
+ */
+async function getMyTasksAndStreak(
+  userId: string,
+  today: string
+): Promise<{ tasks: TodayTask[]; streak: number; error: string | null }> {
+  const supabase = await createClient()
+
+  const from = shiftDate(today, -STREAK_WINDOW_DAYS)
+
+  const { data, error } = await supabase
+    .from('tasks')
+    .select('id, group_id, title, sort_order, done_at, task_date')
+    .eq('user_id', userId)
+    .gte('task_date', from)
+    .lte('task_date', today)
+    .order('sort_order', { ascending: true })
+    .order('created_at', { ascending: true })
+
+  if (error) {
+    return {
+      tasks: [],
+      streak: 0,
+      error: toKoreanDbError(error, '할 일을 불러오지 못했습니다.'),
+    }
+  }
+
+  const rows = data ?? []
+
+  return {
+    tasks: rows.filter((row) => row.task_date === today),
+    streak: calcStreak(rows, today),
+    error: null,
+  }
+}
+
 /* ==========================================================================
  * 페이지 로더 (Server Component 가 부르는 진입점)
  *
@@ -482,25 +625,50 @@ export async function getTodayPageData(
     return { ...empty, error: '로그인이 필요합니다.' }
   }
 
-  const today = await getLocalToday()
+  /**
+   * ── 순차 왕복 4회 → 2회, 질의 6회 → 4회 ─────────────────────────────────
+   * 예전 순서:
+   *   1) getSessionUserId  → auth.getUser()      네트워크 1회
+   *   2) await getLocalToday()                   ← 혼자 한 파를 다 잡아먹음
+   *   3) [group_members, tasks, streak]
+   *   4) groups            (getMyGroups 의 두 번째 질의)
+   *
+   * getLocalToday() 는 getMyGroups() 와 서로 아무 관계가 없는데도 앞에서
+   * 통째로 기다리고 있었습니다. /status 는 이미 이 둘을 Promise.all 로 묶어
+   * 뒀는데(아래) 여기만 빠져 있었습니다. 같은 모양으로 맞춥니다.
+   *
+   * 지금 순서:
+   *   1) getSessionUserId  → auth.getClaims()    JWKS 캐시 적중 시 네트워크 0회
+   *   2) [current_user_local_date rpc | group_members]
+   *   3) [내 할 일 창(오늘+스트릭 한 방) | groups]
+   *
+   * 두 갈래가 서로를 기다리지 않는 게 핵심입니다. 그래서 `Promise.all([today,
+   * groups])` 로 묶고 나서 tasks 를 부르면 안 됩니다 — 그러면 tasks 가 관계도
+   * 없는 groups 질의까지 기다려서 파가 3개가 됩니다. 아래처럼 "오늘 → 내 할 일"
+   * 갈래를 하나의 async 함수로 만들어 groups 갈래와 통째로 병렬시켜야
+   * 2)와 3)에 각각 두 질의가 나란히 들어갑니다.
+   */
+  const ownTasksBranch = async () => {
+    const today = await getLocalToday()
+    return { today, ...(await getMyTasksAndStreak(userId, today)) }
+  }
 
-  const [{ groups, error: groupError }, tasksResult, streakResult] = await Promise.all([
+  const [{ groups, error: groupError }, own] = await Promise.all([
     getMyGroups(userId),
-    getMyTodayTasks(userId, today),
-    getMyStreak(userId, today),
+    ownTasksBranch(),
   ])
 
   const activeGroup =
     groups.find((g) => g.id === preferredGroupId) ?? groups[0] ?? null
 
   return {
-    error: groupError ?? tasksResult.error ?? streakResult.error,
+    error: groupError ?? own.error,
     userId,
-    today,
+    today: own.today,
     groups,
     activeGroup,
-    tasks: tasksResult.tasks,
-    streak: streakResult.streak,
+    tasks: own.tasks,
+    streak: own.streak,
   }
 }
 
@@ -522,8 +690,24 @@ export async function getStatusPageData(
     return { ...empty, error: '로그인이 필요합니다.' }
   }
 
-  // 이 둘은 서로 의존하지 않는다. 순차로 await 하면 화면이 뜨기까지
-  // 왕복이 한 번 더 늘어난다 (탭 전환 때 체감되는 지연).
+  /**
+   * 이 둘은 서로 의존하지 않는다. 순차로 await 하면 화면이 뜨기까지
+   * 왕복이 한 번 더 늘어난다 (탭 전환 때 체감되는 지연).
+   *
+   * ── 순차 왕복 6회 → 4회, 질의 7회 → 6회 ─────────────────────────────────
+   * 여기(로더)는 이미 옳게 묶여 있었다. 줄어든 건 두 군데다:
+   *   - getSessionUserId 가 getUser()(항상 네트워크) → getClaims()(JWKS 캐시
+   *     적중 시 네트워크 0회) 로 바뀌어 맨 앞의 한 파가 사라졌다.
+   *   - getGroupTodayStatus 안에서 tasks 질의가 group_members 와 병렬이 됐다.
+   *
+   * 남은 파:
+   *   1) [rpc | group_members]  2) [groups]
+   *   3) [그룹 group_members | 그룹 tasks]  4) [profiles]
+   *
+   * 2)를 더 줄이려면 activeGroup 을 membership 행만으로 고르고 groups 이름
+   * 조회를 화면 렌더와 겹쳐야 하는데, 그러려면 getMyGroups 의 반환 모양을
+   * 바꿔야 한다. lib/history.ts 가 이 시그니처를 쓰므로 하지 않는다.
+   */
   const [today, { groups, error: groupError }] = await Promise.all([
     getLocalToday(),
     getMyGroups(userId),

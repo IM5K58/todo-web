@@ -13,7 +13,6 @@ import {
   PageHeader,
   SuccessText,
 } from '@/components/ui'
-import { createClient } from '@/lib/supabase/server'
 import { getStatusPageData, type MemberTodayStatus } from '@/lib/tasks'
 
 import { nudgeAction, type StatusErrCode, type StatusOkCode } from './actions'
@@ -96,11 +95,6 @@ function messageFor<K extends string>(
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-const HOUR_MS = 60 * 60 * 1000
-const DAY_MS = 24 * HOUR_MS
-/** Mirrors send_nudge's own ceiling: 3 manual nudges per target per day. */
-const DAILY_NUDGE_LIMIT = 3
-
 function firstParam(raw: string | string[] | undefined): string | null {
   if (typeof raw === 'string') return raw
   if (Array.isArray(raw)) return raw[0] ?? null
@@ -134,20 +128,17 @@ function formatBoardDate(isoDate: string): string {
 }
 
 /** Why a member's 콕 찌르기 button is not on offer right now. */
-type NudgeBlock = 'self' | 'complete' | 'hour' | 'day' | null
+type NudgeBlock = 'self' | 'complete' | null
 
-function blockFor(
-  member: MemberTodayStatus,
-  hourCount: number,
-  dayCount: number,
-): NudgeBlock {
+function blockFor(member: MemberTodayStatus): NudgeBlock {
   // 자기 자신에게는 버튼이 아예 없습니다. send_nudge 가 self_nudge 로 거절하고
   // (0003 §8), 그 아래 nudges_no_self_nudge_chk CHECK 이 한 번 더 막습니다.
   if (member.isMe) return 'self'
   // 다 끝낸 사람은 찌를 이유가 없습니다.
   if (member.total > 0 && member.done >= member.total) return 'complete'
-  if (hourCount >= 1) return 'hour'
-  if (dayCount >= DAILY_NUDGE_LIMIT) return 'day'
+  // [0005] 횟수 제한 해제. 예전에는 여기서 시간당 1회 / 하루 3회를 세어 버튼을
+  // 감췄지만, send_nudge 의 상수가 0(무제한)이 된 뒤로는 화면만 막는 꼴이 된다.
+  // 되살리려면 0005 의 c_hourly_limit / c_daily_limit 와 이 검사를 함께 되돌릴 것.
   return null
 }
 
@@ -252,38 +243,10 @@ export default async function StatusPage({
   const activeGroup = board.activeGroup
   const userId = board.userId
 
-  // ---- the nudge quota, read back from the rows the database already wrote --
-  //
-  // This is what stops 연타 across a reload: the button state is derived from
-  // `nudges`, not from component state that a refresh would forget.
-  //
-  // Presentation only. `send_nudge` re-derives the same counts inside an
-  // advisory lock, so a few seconds of clock skew between this server and
-  // Postgres can at worst leave a button enabled that then answers
-  // 'rate_limited_hour' — which the banner explains in Korean. It can never let
-  // an extra nudge through.
-  //
-  // `source = 'manual'` matters: 0003 §8 excludes auto reminders from the quota,
-  // and policy `nudges_select_group_members` hides other people's auto rows
-  // anyway, so counting them here would be wrong twice over.
-  const supabase = await createClient()
-  const { data: nudgeRows, error: nudgeError } = await supabase
-    .from('nudges')
-    .select('to_user_id, created_at')
-    .eq('group_id', activeGroup.id)
-    .eq('from_user_id', userId)
-    .eq('source', 'manual')
-    .gte('created_at', new Date(Date.now() - DAY_MS).toISOString())
-
-  const hourCountByUser = new Map<string, number>()
-  const dayCountByUser = new Map<string, number>()
-  const hourAgo = Date.now() - HOUR_MS
-  for (const row of nudgeRows ?? []) {
-    dayCountByUser.set(row.to_user_id, (dayCountByUser.get(row.to_user_id) ?? 0) + 1)
-    if (new Date(row.created_at).getTime() > hourAgo) {
-      hourCountByUser.set(row.to_user_id, (hourCountByUser.get(row.to_user_id) ?? 0) + 1)
-    }
-  }
+  // [0005] 넛지 쿼터 집계 쿼리 제거.
+  //   send_nudge 의 제한이 해제되어 셀 것이 없어졌다. 부수 효과로 이 화면의
+  //   DB 왕복이 하나 줄었다. 제한을 되살리면 이 블록도 함께 되살려야 한다
+  //   (git 이력: 0005 이전 버전).
 
   const members = board.members
   const boardIsEmpty = members.every((member) => member.total === 0)
@@ -358,11 +321,7 @@ export default async function StatusPage({
 
             <ul className={`flex flex-col ${boardIsEmpty ? 'border-line border-t pt-1' : ''}`}>
               {members.map((member) => {
-                const block = blockFor(
-                  member,
-                  hourCountByUser.get(member.userId) ?? 0,
-                  dayCountByUser.get(member.userId) ?? 0,
-                )
+                const block = blockFor(member)
 
                 return (
                   /*
@@ -384,10 +343,6 @@ export default async function StatusPage({
                       action={
                         block === 'self' ? undefined : block === 'complete' ? (
                           <Pill tone="accent">다 했어요</Pill>
-                        ) : block === 'hour' ? (
-                          <Pill tone="muted">방금 찔렀어요</Pill>
-                        ) : block === 'day' ? (
-                          <Pill tone="muted">오늘은 그만</Pill>
                         ) : (
                           <form action={nudgeAction}>
                             <input type="hidden" name="groupId" value={activeGroup.id} />
@@ -410,19 +365,12 @@ export default async function StatusPage({
             </ul>
           </>
         )}
-
-        {nudgeError && (
-          <Hint>
-            오늘 누구를 찔렀는지는 불러오지 못했어요. 버튼은 눌러볼 수 있지만, 이미 찌른
-            사람이라면 “한 시간에 한 번” 안내가 뜰 거예요.
-          </Hint>
-        )}
       </Card>
 
       <Card title="콕 찌르기 규칙">
         <Hint>
-          같은 사람은 한 시간에 한 번, 하루에 세 번까지만 찌를 수 있어요. 상대가 알림을
-          켜두지 않았다면 알림은 가지 않고, 그 친구가 앱을 열었을 때만 보여요.
+          횟수 제한 없이 찌를 수 있어요. 다만 상대가 알림을 켜두지 않았다면 알림은 가지
+          않고, 그 친구가 앱을 열었을 때만 보여요.
         </Hint>
         <LinkButton href="/settings" variant="secondary">
           내 알림 설정

@@ -141,7 +141,11 @@ begin
             --     svg 는 일부러 뺐습니다 (⑤ 의 MIME 목록과 같은 이유).
             avatar_url ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(jpg|jpeg|png|webp)$'
             -- (b) 구글 프로필 사진 CDN. 호스트 하나만. 따옴표/꺾쇠/공백 불가.
-            or avatar_url ~ '^https://lh3\.googleusercontent\.com/[A-Za-z0-9._~:/?#@!$&*+,;=%()-]{1,460}$'
+            --     길이는 위의 char_length between 3 and 512 가 막습니다.
+            --     여기서 반복 횟수를 명시하면 안 됩니다 -- Postgres 정규식의
+            --     반복 횟수 상한은 255 라, 460 같은 값을 쓰면 2201B
+            --     (invalid repetition count) 로 마이그레이션이 죽습니다.
+            or avatar_url ~ '^https://lh3\.googleusercontent\.com/[A-Za-z0-9._~:/?#@!$&*+,;=%()-]+$'
           )
         )
       );
@@ -226,7 +230,9 @@ as $fn$
     when p_url ~ ('^' || p_user_id::text
                   || '/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(jpg|jpeg|png|webp)$') then true
     -- (b) 구글 프로필 사진 CDN
-    when p_url ~ '^https://lh3\.googleusercontent\.com/[A-Za-z0-9._~:/?#@!$&*+,;=%()-]{1,460}$' then true
+    --     길이는 위의 char_length 가드가 막습니다. 반복 횟수 상한(255) 때문에
+    --     {1,460} 같은 형태를 쓸 수 없습니다.
+    when p_url ~ '^https://lh3\.googleusercontent\.com/[A-Za-z0-9._~:/?#@!$&*+,;=%()-]+$' then true
     else false
   end;
 $fn$;

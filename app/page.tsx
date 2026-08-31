@@ -1,4 +1,3 @@
-import Link from 'next/link'
 import { redirect } from 'next/navigation'
 
 import { Button, Card, EmptyState, ErrorText, Hint, LinkButton, SuccessText } from '@/components/ui'
@@ -6,6 +5,7 @@ import { STREAK_WINDOW_DAYS, getTodayPageData } from '@/lib/tasks'
 import { createClient } from '@/lib/supabase/server'
 import type { Weekday } from '@/lib/supabase/types'
 
+import GroupSwitcher from './group-switcher'
 import {
   applyTemplatesAction,
   copyTasksFromAction,
@@ -184,6 +184,93 @@ function weekdayOf(isoDate: string): Weekday {
   return new Date(Date.UTC(year, month - 1, day)).getUTCDay() as Weekday
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * ?g= — 헤더 드롭다운이 고른 그룹.
+ *
+ * 모양만 봅니다(UUID 인가). "내가 속한 그룹인가"는 여기서 검사하지 않습니다 —
+ * getTodayPageData 가 내가 속한 그룹 목록에서 find 하고, 못 찾으면 첫 번째로
+ * 돌아갑니다. 그래서 남의 그룹 id 를 URL 에 적어 넣어도 그 그룹의 무엇도
+ * 보이지 않고, 진짜 방어선은 그 아래 RLS 입니다. 모양 검사는 오탈자를 DB 까지
+ * 보내지 않으려는 예의일 뿐입니다.
+ *
+ * 반복된 파라미터(?g=a&g=b)는 배열로 옵니다 — 그때는 무시합니다.
+ */
+function groupParam(raw: string | string[] | undefined): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  return UUID_RE.test(raw) ? raw : undefined
+}
+
+/* ---------------------------------------------------------------------------
+ * [0007] 고정해 둔 그룹 (profiles.default_group_id)
+ * ------------------------------------------------------------------------ */
+
+/**
+ * "처음 보일 그룹" 고정값. 없으면 null.
+ *
+ * 0007 의 컬럼 주석이 이 값을 쓰는 곳으로 "홈 드롭다운 / 현황 화면"을 이름으로
+ * 지목합니다. 고정은 /status 에서 하지만, 고정해 둔 그룹이 홈에서 안 열리면
+ * 그 기능은 반쯤만 작동하는 셈입니다.
+ *
+ * ★ 절대 throw 하지 않고, 실패해도 배너를 띄우지 않습니다 ★ null 은 "고정
+ * 안 됨"이고, 그때 화면은 0007 이전과 정확히 같습니다(첫 그룹). 보조 기능
+ * 하나 때문에 오늘 목록을 오류 화면으로 바꿀 이유가 없습니다.
+ *
+ * ★ 왜 위의 profiles 조회에 컬럼을 하나 더 붙이지 않았나 ★ 그러면 0007 이
+ * 아직 배포되지 않은 데이터베이스에서 42703 이 나면서 profileResult.error 로
+ * 들어가고, 홈 전체가 "불러오지 못했어요"가 됩니다. 따로 떼어 두면 그 실패가
+ * 여기서 끝납니다. 질의는 1회 늘지만 파(wave)는 늘지 않습니다 — 아래 호출부의
+ * Promise.all 안에서 다른 두 갈래와 나란히 출발합니다.
+ *
+ * ★ 캐스트인 이유 ★ lib/supabase/types.ts 는 제 소유가 아니고, 이 글을 쓰는
+ * 시점의 profiles Row 에는 아직 default_group_id 가 없습니다. DB 에는 실재하는
+ * 컬럼이라 `.select('default_group_id')` 를 그냥 쓰면 tsc 가 깨집니다.
+ * types.ts 에 컬럼이 생기면 이 캐스트를 지우세요 — app/status/page.tsx 의
+ * getDefaultGroupId 도 같은 이유로 같은 모양을 하고 있습니다.
+ *
+ * `.eq('id', userId)` 는 생략 불가입니다. profiles 의 SELECT 정책은 "나 또는
+ * 나와 그룹을 공유하는 사람"이라 조건 없이 부르면 동료의 행도 함께 옵니다.
+ */
+type ProfileDefaultGroupQuery = {
+  select: (columns: string) => {
+    eq: (
+      column: string,
+      value: string,
+    ) => {
+      maybeSingle: () => PromiseLike<{
+        data: { default_group_id: string | null } | null
+        error: { code?: string | null; message?: string } | null
+      }>
+    }
+  }
+}
+
+async function getDefaultGroupId(userId: string): Promise<string | undefined> {
+  const supabase = await createClient()
+
+  // ★ select('*') 금지 ★ 0003 이 profiles 의 SELECT 를 컬럼 단위로 좁혔습니다.
+  const profiles = supabase.from('profiles') as unknown as ProfileDefaultGroupQuery
+  const { data, error } = await profiles
+    .select('default_group_id')
+    .eq('id', userId)
+    .maybeSingle()
+
+  if (error) {
+    // 42703 = 0007 미배포. 그 외에는 진짜 실패. 어느 쪽이든 화면은 폴백합니다.
+    if (error.code !== '42703') {
+      console.error('[home] default_group_id 조회 실패', {
+        code: error.code,
+        message: error.message,
+      })
+    }
+    return undefined
+  }
+
+  const value = data?.default_group_id
+  return typeof value === 'string' && UUID_RE.test(value) ? value : undefined
+}
+
 /** ?c= / ?s= 는 액션이 만든 값이지만 URL 은 사용자가 고칠 수 있습니다. */
 function countParam(raw: string | string[] | undefined): number {
   if (typeof raw !== 'string') return 0
@@ -272,12 +359,16 @@ export default async function TodayPage({
   searchParams,
 }: {
   /**
-   * 0004 의 "오늘 채우기" 결과만 읽습니다(fill / c / s / fillerr). 그 외 파라미터는
-   * 무시하고, 이 화면의 데이터 로딩에는 아무 영향을 주지 않습니다.
+   * 읽는 것은 둘뿐입니다:
+   *   · fill / c / s / fillerr — 0004 "오늘 채우기" 의 결과 알림
+   *   · g                      — 헤더 드롭다운이 고른 그룹 (아래 groupParam)
+   * 그 외 파라미터는 무시하고, 이 화면의 데이터 로딩에 아무 영향을 주지 않습니다.
    */
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>
 }) {
   const params = await searchParams
+
+  const preferredGroupId = groupParam(params.g)
 
   const fillKind =
     params.fill === 'applied' || params.fill === 'copied' ? (params.fill as FillKind) : null
@@ -298,7 +389,7 @@ export default async function TodayPage({
     redirect('/login')
   }
 
-  const [profileResult, data] = await Promise.all([
+  const [profileResult, data, defaultGroupId] = await Promise.all([
     // NEVER .select('*') here. Migration 0003 narrowed the profiles SELECT
     // grant to (id, display_name, avatar_emoji, timezone, created_at), so '*'
     // reaches for the auto_nudge_* columns and comes back 42501.
@@ -309,7 +400,14 @@ export default async function TodayPage({
       .maybeSingle(),
     // Groups + today's tasks + streak, all against the database's own idea of
     // "today". Never throws; a failure arrives as `data.error` in Korean.
-    getTodayPageData(),
+    //
+    // ?g= 는 "먼저 보고 싶은 그룹"입니다. 로더가 내 그룹 목록에서 찾고, 없으면
+    // 첫 번째로 돌아갑니다 — 그래서 링크를 잘못 눌러도 화면이 깨지지 않습니다.
+    // lib/tasks.ts 는 손대지 않습니다(이미 이 인자를 받습니다).
+    getTodayPageData(preferredGroupId),
+    // [0007] 고정해 둔 그룹. 실패해도 undefined 일 뿐이라 이 파를 늦추지도,
+    // 아래 어떤 분기도 바꾸지 않습니다.
+    getDefaultGroupId(userId),
   ])
 
   if (profileResult.error) {
@@ -347,7 +445,30 @@ export default async function TodayPage({
     return <NoGroupState needsOnboarding={needsOnboarding} />
   }
 
-  const activeGroup = data.activeGroup
+  /**
+   * 어느 그룹을 펼쳐 볼 것인가. 우선순위는 셋입니다:
+   *   1. ?g=  — 방금 드롭다운으로 고른 것. 언제나 이깁니다.
+   *   2. 고정해 둔 그룹 (profiles.default_group_id, /status 에서 설정)
+   *   3. 로더의 기본값 = 가장 먼저 가입한 그룹
+   *
+   * 1번은 이미 로더가 반영했습니다(getTodayPageData 에 넘겼습니다). 그래서
+   * 여기서는 ?g= 가 없을 때만 2번을 얹습니다.
+   *
+   * ★ 이걸 로더 뒤에서 골라도 되는 이유 ★ 오늘 목록은 그룹으로 걸러지지
+   * 않습니다 — getMyTasksAndStreak 는 user_id 와 날짜로만 조회합니다
+   * (lib/tasks.ts). activeGroup 이 정하는 것은 "헤더에 어느 그룹 이름을
+   * 쓰는가" 와 "새 할 일이 어느 그룹으로 들어가는가" 뿐이라, 조회를 다시
+   * 하지 않고 여기서 바꿔도 화면과 데이터가 어긋나지 않습니다.
+   *
+   * 고정해 둔 그룹을 이미 나갔다면 목록에 없으므로 find 가 undefined 를
+   * 돌려주고 조용히 3번으로 내려갑니다. (DB 쪽에도 같은 안전장치가 있습니다 —
+   * 0007 의 clear_default_group_on_leave 트리거가 값을 NULL 로 되돌립니다.)
+   */
+  const activeGroup =
+    (preferredGroupId || !defaultGroupId
+      ? undefined
+      : data.groups.find((group) => group.id === defaultGroupId)) ?? data.activeGroup
+
   if (!activeGroup) {
     return <LoadError message={READ_FAILED_KO} />
   }
@@ -451,10 +572,16 @@ export default async function TodayPage({
     <Screen>
       {/* ---- 헤더 ------------------------------------------------------ */}
       <header className="flex flex-col gap-1">
-        <p className="text-muted truncate text-sm">
-          {activeGroup.name}
-          {otherGroupCount > 0 ? ` 외 ${otherGroupCount}개` : ''}
-        </p>
+        {/*
+          그룹 선택. 그룹이 1개면 컴포넌트가 스스로 이름만 글자로 그리므로,
+          예전의 "{이름} 외 N개" 줄과 정확히 같은 자리·같은 모양입니다.
+          "외 N개"를 더 붙이지 않는 이유: 드롭다운을 열면 몇 개인지 보이고,
+          숫자를 두 번 말하면 셀렉트가 무엇을 고르는 것인지 흐려집니다.
+        */}
+        <GroupSwitcher
+          groups={data.groups.map((group) => ({ id: group.id, name: group.name }))}
+          activeGroupId={activeGroup.id}
+        />
 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <h1 className="text-fg text-2xl font-semibold tracking-tight">
@@ -477,23 +604,11 @@ export default async function TodayPage({
         </div>
 
         {/*
-          날짜 줄 오른쪽에 기록 화면 링크. 스트릭 배지 바로 아래이면서, 배지
-          자체(h-7)를 탭 대상으로 만들지 않는 자리입니다 -- 28px 은 44px 최소
-          터치 목표에 못 미칩니다. 여기 링크는 h-11 이고, -my-2 로 날짜 줄의
-          시각적 높이는 그대로 둡니다.
-
-          하단 탭바에 5번째 탭을 만들지 않은 이유: 기록은 매일 여는 화면이
-          아니고, 375px 에서 5탭이면 한 칸이 75px 로 좁아집니다.
+          예전에는 이 줄 오른쪽에 "기록 보기 →" 링크가 있었습니다. 지웠습니다 —
+          /history 가 하단 탭('내기록')으로 올라갔고, 같은 화면으로 가는 길이
+          두 개면 탭이 유일한 입구라는 사실이 흐려집니다.
         */}
-        <div className="flex items-center justify-between gap-3">
-          <p className="text-muted text-sm tabular-nums">{headerDate}</p>
-          <Link
-            href="/history"
-            className="text-muted -my-2 inline-flex h-11 shrink-0 items-center gap-1 text-sm underline-offset-4 hover:underline"
-          >
-            기록 보기 <span aria-hidden="true">→</span>
-          </Link>
-        </div>
+        <p className="text-muted text-sm tabular-nums">{headerDate}</p>
       </header>
 
       {needsOnboarding && <OnboardingNudge />}
@@ -611,9 +726,8 @@ export default async function TodayPage({
           /settings 아래로 넣지 않은 이유: 설정에 묻으면 아무도 못 찾습니다.
           위의 "빠르게 채우기" 카드는 목록이 비어 있을 때만 나타나므로, 이미
           할 일을 적어 둔 사람에게는 이 줄이 유일한 경로입니다. 하단 탭바에
-          5번째 탭을 만들지 않은 것은 기록 링크와 같은 이유입니다 — 375px 에서
-          5탭이면 한 칸이 75px 로 좁아지고, 반복 할 일은 매일 여는 화면이
-          아닙니다.
+          5번째 탭을 만들지 않은 이유는 375px 에서 5탭이면 한 칸이 75px 로
+          좁아지고, 반복 할 일은 매일 여는 화면이 아니기 때문입니다.
         */}
         <LinkButton href="/templates" variant="secondary">
           반복 할 일 관리

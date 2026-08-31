@@ -54,6 +54,7 @@
 
 import type { PostgrestError } from '@supabase/supabase-js'
 
+import { resolveAvatar, type ResolvedAvatar } from '@/lib/avatar'
 import { createClient } from '@/lib/supabase/server'
 import type { GroupRole } from '@/lib/supabase/types'
 
@@ -87,6 +88,21 @@ export type MemberTodayStatus = {
   userId: string
   displayName: string
   avatarEmoji: string
+  /**
+   * [0007] 이미 계산이 끝난 아바타. 화면은 이 값만 그리면 됩니다.
+   *
+   * ★ 왜 avatar_url 원본이 아니라 결과를 담는가 ★
+   * 남의 행을 그릴 때 `resolveAvatar({ ..., userMetadata })` 를 부르는 실수를
+   * 구조적으로 막기 위해서입니다. 아래 getGroupTodayStatus() 의 긴 경고를
+   * 읽으세요 — 요약하면, 내 JWT 의 메타데이터를 남의 행에 넘기면 내 사진이
+   * 친구 얼굴 자리에 붙습니다.
+   *
+   * ★ 옵셔널인 이유 ★ 이 필드를 아직 읽지 않는 화면(app/status/page.tsx)이
+   * 그대로 컴파일돼야 하고, 0007 이 배포되지 않은 DB 에서는 avatar_url 을
+   * 읽을 수 없어 이모지만 남습니다. 없으면 `avatarEmoji` 로 그리세요.
+   * 런타임에는 이 함수가 언제나 채워 줍니다(최악의 경우 kind: 'emoji').
+   */
+  avatar?: ResolvedAvatar
   role: GroupRole
   /** 오늘 적은 할 일 총 개수. 0 이면 "아직 안 적었어요". */
   total: number
@@ -388,6 +404,113 @@ export async function getMyTodayTasks(
  * 달라지는 것은 "멤버 질의가 실패했을 때 tasks 질의도 이미 떠 있다"는 점뿐이고,
  * 그건 버려집니다(SELECT 라 부작용 없음).
  */
+/* --------------------------------------------------------------------------
+ * 멤버 아바타 조회 (0007) — /status 와 /groups 가 같은 배관을 씁니다
+ * ------------------------------------------------------------------------ */
+
+/** 멤버 목록 한 줄을 그리는 데 필요한 profiles 컬럼. `*` 는 42501 입니다. */
+export type MemberAvatarProfile = {
+  id: string
+  display_name: string
+  avatar_emoji: string
+  /**
+   * [0007] Storage 경로('<uuid>/<파일>.jpg') 또는 lh3 절대 URL.
+   * 0007 미배포 DB 에서는 이 컬럼 없이 조회하므로 옵셔널입니다.
+   */
+  avatar_url?: string | null
+}
+
+/**
+ * `supabase.from('profiles')` 의 최소 모양.
+ *
+ * ★ 캐스트가 필요한 이유 ★ lib/supabase/types.ts 는 제 소유가 아니고, 이 글을
+ * 쓰는 시점의 profiles Row 에는 avatar_url 이 없습니다. 타입이 붙은 채로
+ * `.select('… , avatar_url')` 을 쓰면 DB 에는 실재하는 컬럼 때문에 tsc 가
+ * 깨집니다. types.ts 에 컬럼이 생기면 이 타입과 캐스트를 지우세요.
+ * (app/page.tsx 의 getDefaultGroupId, app/me/page.tsx 가 같은 처방입니다.)
+ */
+export type ProfilesReader = {
+  from: (table: string) => {
+    select: (columns: string) => {
+      in: (
+        column: string,
+        values: string[],
+      ) => PromiseLike<{
+        data: MemberAvatarProfile[] | null
+        error: { code?: string | null; message?: string } | null
+      }>
+    }
+  }
+}
+
+/** ★ select('*') 금지 ★ profiles 는 컬럼 단위 SELECT 권한입니다(0003/0007). */
+const MEMBER_PROFILE_COLUMNS = 'id, display_name, avatar_emoji, avatar_url'
+/** 0007 미배포(42703) 폴백. 사진만 빠지고 나머지 화면은 그대로 삽니다. */
+const MEMBER_PROFILE_COLUMNS_LEGACY = 'id, display_name, avatar_emoji'
+
+/**
+ * 여러 명의 프로필을 한 번에. avatar_url 이 없는 DB 를 만나면 한 번만 물러섭니다.
+ *
+ * 왕복은 평소 1회입니다. 0007 이 배포되지 않은 DB 에서만 2회가 되고, 그건
+ * "사진 기능이 아직 없는 환경" 이라는 뜻이라 영구적이지 않습니다. 42703 을
+ * 그냥 오류로 두면 /status 와 /groups 의 **멤버 목록 전체가** 사라지므로,
+ * 여기서 삼키는 편이 정직합니다(사진만 없어지고 이름은 나옵니다).
+ *
+ * client 는 caller 가 이미 만든 것을 넘기세요 — 새로 만들면 쿠키를 다시 읽습니다.
+ */
+export async function fetchMemberProfiles(
+  client: ProfilesReader,
+  userIds: string[],
+): Promise<{ data: MemberAvatarProfile[]; error: PostgrestError | null }> {
+  if (userIds.length === 0) return { data: [], error: null }
+
+  const first = await client.from('profiles').select(MEMBER_PROFILE_COLUMNS).in('id', userIds)
+  if (!first.error) return { data: first.data ?? [], error: null }
+
+  // 42703 = undefined_column = 0007 미배포. 그 외에는 진짜 실패입니다.
+  if (first.error.code !== '42703') {
+    return { data: [], error: first.error as PostgrestError }
+  }
+
+  // ★ from() 을 다시 부릅니다 ★ postgrest-js 의 쿼리 빌더는 URL 객체를 재사용해
+  // 필터를 append 합니다. 같은 빌더에 .in() 을 두 번 걸면 두 번째 요청에
+  // `id=in.(…)` 이 두 개 실립니다(결과는 같지만 요청이 지저분해집니다).
+  const legacy = await client
+    .from('profiles')
+    .select(MEMBER_PROFILE_COLUMNS_LEGACY)
+    .in('id', userIds)
+  return {
+    data: legacy.data ?? [],
+    error: legacy.error ? (legacy.error as PostgrestError) : null,
+  }
+}
+
+/**
+ * 남의 행 1개의 아바타. **이 함수에는 userMetadata 를 받는 자리가 없습니다.**
+ *
+ * ⚠️⚠️ 그게 이 함수가 존재하는 유일한 이유입니다 ⚠️⚠️
+ * 구글 로그인 사진은 **내 JWT 의 user_metadata** 에서만 읽힙니다. 그룹 동료의
+ * auth 메타데이터를 읽을 방법은 없습니다(lib/avatar.ts 머리말). 그러니 남의
+ * 행을 그리면서 `resolveAvatar({ ..., userMetadata: myClaims })` 를 부르면
+ *   1) 내 구글 사진이 **친구 얼굴 자리에** 붙고,
+ *   2) user_metadata 는 `auth.updateUser({ data })` 로 본인이 자유롭게 쓰는
+ *      값이라, "임의 https URL" 을 그리게 만드는 구멍이 **나만 보던 것에서
+ *      그룹 전원이 보는 것으로** 넓어집니다(검토 FINDING #7).
+ * 남의 행은 avatar_url + avatar_emoji, 이 둘만 씁니다.
+ *
+ * 본인 행도 여기서는 똑같이 취급합니다. /status 는 서버 컴포넌트가 아니라
+ * 이 로더가 만든 값을 그대로 그리고, "내 행에만 구글 사진" 같은 예외를 두면
+ * 목록 안에서 나 혼자 다른 규칙으로 그려집니다. 내 구글 사진을 친구들에게도
+ * 보이려면 마이페이지에서 저장하면 됩니다 — 그러면 avatar_url 로 들어옵니다.
+ */
+function memberAvatar(profile: MemberAvatarProfile | undefined): ResolvedAvatar {
+  return resolveAvatar({
+    avatarUrl: profile?.avatar_url ?? null,
+    // ★ userMetadata 를 넘기지 마세요 ★ 위 주석 참고. 자리 자체를 비워 둡니다.
+    avatarEmoji: profile?.avatar_emoji ?? null,
+  })
+}
+
 export async function getGroupTodayStatus(
   groupId: string,
   today: string,
@@ -416,10 +539,11 @@ export async function getGroupTodayStatus(
 
   const userIds = members.map((m) => m.user_id)
 
-  const { data: profiles, error: profileError } = await supabase
-    .from('profiles')
-    .select('id, display_name, avatar_emoji')
-    .in('id', userIds)
+  // ★ select('*') 금지 ★ 컬럼 목록과 0007 폴백은 fetchMemberProfiles 안에 있습니다.
+  const { data: profiles, error: profileError } = await fetchMemberProfiles(
+    supabase as unknown as ProfilesReader,
+    userIds,
+  )
 
   if (profileError) {
     return { members: [], error: toKoreanDbError(profileError, '프로필을 불러오지 못했습니다.') }
@@ -447,6 +571,8 @@ export async function getGroupTodayStatus(
       // 프로필이 안 보이는 경우(가입 트리거가 실패한 계정)도 정직하게 표시합니다.
       displayName: profile?.display_name ?? '알 수 없는 친구',
       avatarEmoji: profile?.avatar_emoji ?? '🙂',
+      // ⚠️ 남의 행입니다. userMetadata 는 절대 넘기지 않습니다 — memberAvatar() 참고.
+      avatar: memberAvatar(profile),
       role: m.role,
       total: counts.total,
       done: counts.done,

@@ -12,7 +12,9 @@ import {
   PageHeader,
   SuccessText,
 } from '@/components/ui'
+import { avatarAltText, resolveAvatar, type ResolvedAvatar } from '@/lib/avatar'
 import { createClient } from '@/lib/supabase/server'
+import { fetchMemberProfiles, type ProfilesReader } from '@/lib/tasks'
 import type { GroupRole } from '@/lib/supabase/types'
 
 import {
@@ -38,7 +40,8 @@ import {
  *                     roster query below cannot leak a group we are not in even
  *                     if the id list were wrong.
  *   profiles          [0003] SELECT is also a COLUMN grant (id, display_name,
- *                     avatar_emoji, timezone, created_at) — the auto_nudge_*
+ *                     avatar_emoji, timezone, created_at; [0007] added
+ *                     default_group_id and avatar_url) — the auto_nudge_*
  *                     columns are excluded, so `select('*')` fails here too.
  *                     Policy: self, or someone we share a group with.
  *   invite_code       Reachable ONLY through rpc('get_invite_code'), which
@@ -95,14 +98,55 @@ function messageFor<K extends string>(
 // ---------------------------------------------------------------------------
 
 const FALLBACK_NAME = '친구'
-const FALLBACK_EMOJI = '🙂'
 
 type MemberView = {
   userId: string
   displayName: string
-  avatarEmoji: string
+  /**
+   * [0007] Already-resolved avatar — profiles.avatar_url or the emoji.
+   *
+   * ⚠️⚠️ NEVER pass `userMetadata` when resolving a row that is not mine ⚠️⚠️
+   * The Google login photo lives in MY JWT and there is no way to read a
+   * teammate's auth metadata (see lib/avatar.ts). Handing my metadata to a
+   * teammate's row would (1) paste my photo onto my friend's face and
+   * (2) widen the "any https URL in user_metadata" hole from my own screen to
+   * everyone's, because `auth.updateUser({ data })` lets a user write that bag
+   * freely. Other people's rows get `avatarUrl` + `avatarEmoji`, nothing else.
+   * That rule is enforced in one place — `lib/tasks.ts` `memberAvatar()` — and
+   * this file follows it below.
+   */
+  avatar: ResolvedAvatar
   role: GroupRole
   isSelf: boolean
+}
+
+/**
+ * One member's avatar, `<img>` when there is a photo and the emoji otherwise.
+ *
+ * A plain `<img>`, not `next/image`: `images.remotePatterns` only lists
+ * `*.supabase.co`, so a Google photo stored in `avatar_url` (lh3…) would 400
+ * through the optimizer. A 40px avatar has nothing to gain from it anyway.
+ *
+ * No `onError` fallback here — this is a Server Component and the emoji is
+ * already the alt-less sibling in `ResolvedAvatar.emoji`. A broken URL leaves
+ * the round grey well behind it, which is the same shape as the emoji case.
+ */
+function MemberAvatar({ member }: { member: MemberView }) {
+  if (member.avatar.kind === 'image' && member.avatar.imageUrl) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
+        src={member.avatar.imageUrl}
+        // The name is right next to it in text, so the alt is empty on purpose.
+        alt={avatarAltText(member.displayName)}
+        className="size-10 rounded-full object-cover"
+        referrerPolicy="no-referrer"
+        loading="lazy"
+        decoding="async"
+      />
+    )
+  }
+  return <span aria-hidden="true">{member.avatar.emoji}</span>
 }
 
 /** Owners first, then longest-standing — the same order the DB promotes heirs in. */
@@ -187,14 +231,14 @@ export default async function GroupsPage({
   // ---- profiles for everyone on the roster --------------------------------
   const memberIds = [...new Set(roster.map((row) => row.user_id))]
 
-  // ★ Named columns again — 0003 narrowed the profiles SELECT grant too.
-  const profilesResult =
-    memberIds.length > 0
-      ? await supabase
-          .from('profiles')
-          .select('id, display_name, avatar_emoji')
-          .in('id', memberIds)
-      : { data: [], error: null }
+  // ★ Named columns again — 0003 narrowed the profiles SELECT grant too, and
+  // 0007 added avatar_url to it. The column list and the 42703 fallback for a
+  // database that has not run 0007 yet both live in `fetchMemberProfiles`, so
+  // /status and /groups cannot drift apart on what a member row is made of.
+  const profilesResult = await fetchMemberProfiles(
+    supabase as unknown as ProfilesReader,
+    memberIds,
+  )
 
   const profilesFailed = Boolean(profilesResult.error)
   const profileById = new Map(
@@ -267,7 +311,13 @@ export default async function GroupsPage({
             return {
               userId: row.user_id,
               displayName: profile?.display_name.trim() || FALLBACK_NAME,
-              avatarEmoji: profile?.avatar_emoji.trim() || FALLBACK_EMOJI,
+              // ⚠️ Someone else's row: `avatarUrl` + `avatarEmoji` only.
+              // Passing `userMetadata` here would paste MY Google photo onto
+              // every face in this list — see the MemberView doc above.
+              avatar: resolveAvatar({
+                avatarUrl: profile?.avatar_url ?? null,
+                avatarEmoji: profile?.avatar_emoji ?? null,
+              }),
               role: row.role,
               isSelf: row.user_id === userId,
             }
@@ -301,7 +351,7 @@ export default async function GroupsPage({
                       className="border-line flex flex-col border-b last:border-b-0"
                     >
                       <ListRow
-                        leading={<span aria-hidden="true">{member.avatarEmoji}</span>}
+                        leading={<MemberAvatar member={member} />}
                         title={
                           <>
                             {member.displayName}

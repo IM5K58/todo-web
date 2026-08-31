@@ -15,16 +15,33 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
 
   images: {
-    // Supabase Storage (avatars / attachments) via next/image. Kept here from
-    // day one so adding a bucket later does not require a config change and a
-    // redeploy of every environment.
-    remotePatterns: [
-      {
-        protocol: 'https',
-        hostname: '*.supabase.co',
-        pathname: '/storage/v1/**',
-      },
-    ],
+    // This app renders ZERO next/image. Every avatar is a plain <img>
+    // (lib/avatar.ts explains why: the Google photo host lh3.googleusercontent
+    // .com would have to be whitelisted too, and a 40px avatar gains nothing
+    // from optimization).
+    //
+    // `remotePatterns` used to carry `hostname: '*.supabase.co'` "so adding a
+    // bucket later does not require a config change". That is not a dormant
+    // convenience -- /_next/image is always mounted (and proxy.ts:223 excludes
+    // it from the auth matcher), so the pattern was a live, unauthenticated
+    // open proxy: anyone could hand us a URL on ANY *.supabase.co project and
+    // make our Vercel image-optimization quota fetch and transcode it.
+    // Optimization is a metered, CPU-heavy line item. An empty list makes
+    // /_next/image reject every remote `url=`; `unoptimized` short-circuits
+    // the transform itself.
+    //
+    // TO USE next/image LATER, restore BOTH lines below -- pin the exact
+    // project host, never a wildcard, and never a bare `/storage/v1/**`:
+    //   unoptimized: false,
+    //   remotePatterns: [
+    //     { protocol: 'https', hostname: '<project-ref>.supabase.co',
+    //       pathname: '/storage/v1/object/public/avatars/**' },
+    //     { protocol: 'https', hostname: 'lh3.googleusercontent.com' },
+    //   ],
+    // and update the "next/image 가 아니라 <img>" notes in lib/avatar.ts and
+    // app/me/page.tsx, which cite this block as the reason.
+    unoptimized: true,
+    remotePatterns: [],
   },
 
   async headers() {

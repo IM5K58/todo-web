@@ -13,9 +13,11 @@ import {
   PageHeader,
   SuccessText,
 } from '@/components/ui'
+import { getGroupPushStatus, isPushOff, type PushStatusMap } from '@/lib/push-status'
 import { getStatusPageData, type MemberTodayStatus } from '@/lib/tasks'
 
 import { nudgeAction, type StatusErrCode, type StatusOkCode } from './actions'
+import StatusRealtime from './realtime'
 
 /**
  * /status — 오늘 현황. 이 앱의 사회적 압력이 나오는 화면.
@@ -35,17 +37,36 @@ import { nudgeAction, type StatusErrCode, type StatusOkCode } from './actions'
  *     rows visible. That policy is the entire reason this screen can exist.
  *   - returns `error` as Korean copy instead of throwing.
  *
- * The only read this file adds is the nudge quota, because `nudges` is not part
- * of the task data layer. Everything about actually SENDING a nudge lives in
- * ./actions.ts and, below that, in `public.send_nudge`.
+ * Everything about actually SENDING a nudge lives in ./actions.ts and, below
+ * that, in `public.send_nudge`.
  *
- * WHAT THIS SCREEN CANNOT KNOW
- * ---------------------------
- * Whether a friend has notifications switched on. `push_subscriptions` is
- * scoped to its owner by policy `push_subscriptions_all_own`
- * (`user_id = auth.uid()`), so there is no read that would tell us in advance
- * and no honest way to badge a row. The nudge action reports it AFTERWARDS
- * from the push fan-out result — see the `sent_pushoff` notice below.
+ * WHETHER A FRIEND HAS NOTIFICATIONS ON  [0006]
+ * ---------------------------------------------
+ * This used to be unknowable here, and the comment that lived at this spot said
+ * so: `push_subscriptions` is scoped to its owner by policy
+ * `push_subscriptions_all_own` (`user_id = auth.uid()`), so there is no read
+ * that would tell us in advance. That policy has NOT changed — widening it
+ * would hand groupmates `endpoint` / `p256dh` / `auth`, which together are the
+ * credential for pushing to somebody else's device.
+ *
+ * 0006 opened a keyhole instead: `public.group_push_status(p_group_id)` is
+ * SECURITY DEFINER and returns nothing but `(user_id, has_push)` — a boolean
+ * folded out of `exists()`, never a count, never an endpoint. lib/push-status.ts
+ * wraps it and, crucially, never throws: an auxiliary badge must not be able to
+ * take the board down with it.
+ *
+ * So the row can now say 알림 꺼둠 BEFORE the nudge. The `sent_pushoff` notice
+ * below still exists and still tells the fuller story afterwards (that the
+ * friend will see it when they open the app) — the badge deliberately does not
+ * repeat that sentence.
+ *
+ * LIVE UPDATES  [0006]
+ * --------------------
+ * <StatusRealtime> subscribes to `tasks` and calls `router.refresh()`. It reads
+ * no payload and renders no markup; see app/status/realtime.tsx for why (short
+ * version: `tasks` is pinned to REPLICA IDENTITY DEFAULT because Postgres
+ * Changes does not apply RLS to DELETE, and this screen shows an aggregate that
+ * only a fresh server read can compute correctly).
  */
 
 export const metadata: Metadata = {
@@ -207,6 +228,52 @@ function Pill({ tone, children }: { tone: 'accent' | 'muted'; children: React.Re
   )
 }
 
+/**
+ * [0006] "알림 꺼둠" — a small auxiliary marker under a member row.
+ *
+ * ★ Why it is NOT in MemberProgressRow's `action` slot ★
+ * That slot already holds either the 콕 찌르기 button or the 다 했어요 pill, and
+ * those two are the point of the row. A third thing elbowing in there would
+ * shrink the name and the progress bar on a 360px screen to buy space for a
+ * detail nobody came for. `note` is no good either — it only renders when the
+ * member has zero tasks, and "wrote nothing" and "notifications off" are
+ * independent facts that can both be true.
+ *
+ * So it goes on its own line inside the <li>, indented to line up with the text
+ * column (40px avatar + 12px gap = 52px = pl-13). It reads as a footnote to the
+ * row above it, which is exactly its weight.
+ *
+ * ★ What it must never say ★ How many devices, which device, when. 0006 folds
+ * all of that into one boolean on purpose. And it does not re-explain what
+ * happens if you nudge this person anyway — OK_MESSAGES.sent_pushoff above
+ * already says that, at the moment it actually matters.
+ */
+function PushOffNote({ name, isSelf }: { name: string; isSelf: boolean }) {
+  return (
+    <p className="text-muted -mt-1 pb-3 pl-13 text-xs [word-break:keep-all]">
+      {isSelf ? (
+        <>
+          {/*
+            자기 자신에게는 사실 통보가 아니라 다음 행동을 줍니다. 여기서
+            "내가 안 켰다"를 알게 되는 것 자체가 /settings 로 갈 유일한 계기고,
+            그렇지 않으면 이 화면은 남의 상태만 알려주고 끝납니다.
+          */}
+          <span className="mr-1">알림 꺼둠</span>
+          <Link href="/settings" className="text-fg underline underline-offset-4">
+            알림 켜러 가기
+          </Link>
+        </>
+      ) : (
+        <>
+          {/* 이름을 눈에는 반복하지 않되, 스크린 리더에는 어느 행의 각주인지
+              들려줍니다. 시각적으로는 바로 위 행이 곧 맥락입니다. */}
+          <span className="sr-only">{name}님은 </span>알림 꺼둠
+        </>
+      )}
+    </p>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -248,6 +315,32 @@ export default async function StatusPage({
   //   DB 왕복이 하나 줄었다. 제한을 되살리면 이 블록도 함께 되살려야 한다
   //   (git 이력: 0005 이전 버전).
 
+  /**
+   * [0006] 알림 켬/끔.
+   *
+   * ── 왕복 한 번을 더 씁니다. 알고 쓰는 것입니다 ────────────────────────────
+   * `p_group_id` 가 필요하고, 그 값은 getStatusPageData() 가 "선호 그룹이 내
+   * 그룹이 아니면 첫 번째 그룹" 규칙으로 정합니다. 그러니 board 보다 먼저
+   * 출발시킬 수 없습니다 — preferredGroupId 로 미리 쏘면 폴백이 일어난 경우
+   * 엉뚱한 그룹의 답을 받게 됩니다.
+   *
+   * 정말로 없애려면 이 RPC 가 lib/tasks.ts 의 getGroupTodayStatus 안에서
+   * group_members/tasks 와 같은 파에 들어가야 하는데, 그건 그 파일의 반환
+   * 모양을 바꾸는 일이고 /history 등 다른 화면이 그 시그니처를 씁니다.
+   * 소유하지 않은 파일이라 하지 않습니다.
+   *
+   * 대신 비싼 쪽을 값싸게 만들어 뒀습니다: 이 조회는 실패해도 throw 하지 않고
+   * 빈 Map 을 돌려주며, 빈 Map 은 "전원 알림 꺼짐" 이 아니라 "모르겠음" 이라
+   * 아무 배지도 붙지 않습니다. 그리고 board.error 로 이미 되돌아간 경로에서는
+   * 애초에 여기까지 오지 않으므로, 화면이 깨진 상태로 이 왕복을 쓰는 일은
+   * 없습니다.
+   *
+   * push.error 는 일부러 화면에 쓰지 않습니다. 진행률도 콕 찌르기도 멀쩡한데
+   * 배지 하나 때문에 오류 배너를 띄우면, 사용자는 보드를 믿지 못하게 됩니다.
+   */
+  const push = await getGroupPushStatus(activeGroup.id)
+  const pushStatuses: PushStatusMap = push.statuses
+
   const members = board.members
   const boardIsEmpty = members.every((member) => member.total === 0)
   const finishedCount = members.filter(
@@ -257,6 +350,15 @@ export default async function StatusPage({
   // ---- render -------------------------------------------------------------
   return (
     <Screen>
+      {/*
+        [0006] 렌더링하는 것이 없는 컴포넌트입니다. `tasks` 를 구독하다가
+        그룹원의 체크/추가/삭제가 오면 router.refresh() 로 이 서버 컴포넌트를
+        다시 받습니다. key 없이도 groupId prop 변경으로 재구독하지만, 그룹 칩
+        전환이 곧 "다른 채널" 이라는 걸 읽는 사람에게도 분명히 해 둡니다.
+        Realtime 이 안 되는 환경에서는 아무 일도 일어나지 않습니다(에러 없음).
+      */}
+      <StatusRealtime key={activeGroup.id} groupId={activeGroup.id} />
+
       <PageHeader title="오늘 현황" backHref="/" backLabel="오늘로 돌아가기" />
 
       <header className="flex flex-col gap-1">
@@ -322,6 +424,9 @@ export default async function StatusPage({
             <ul className={`flex flex-col ${boardIsEmpty ? 'border-line border-t pt-1' : ''}`}>
               {members.map((member) => {
                 const block = blockFor(member)
+                // `=== false` 로 좁힌 판정입니다(isPushOff). `!get(id)` 로 쓰면
+                // 조회가 실패한 날 전원에게 "알림 꺼둠" 이 붙습니다.
+                const pushOff = isPushOff(pushStatuses, member.userId)
 
                 return (
                   /*
@@ -359,6 +464,9 @@ export default async function StatusPage({
                         )
                       }
                     />
+                    {pushOff && (
+                      <PushOffNote name={member.displayName} isSelf={member.isMe} />
+                    )}
                   </li>
                 )
               })}

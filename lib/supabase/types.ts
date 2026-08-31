@@ -770,6 +770,43 @@ export type Database = {
           skipped: number
         }[]
       }
+      /**
+       * [0006] SECURITY DEFINER. 그룹원이 웹푸시 알림을 켜 뒀는지를
+       * **불리언으로만** 노출합니다.
+       *
+       * ★ 왜 push_subscriptions 를 직접 읽지 않는가 ★
+       * 0002 의 `push_subscriptions_all_own` 정책은 `user_id = auth.uid()` 라
+       * 본인 행만 읽힙니다. 그 정책을 그룹원까지 넓히면 `endpoint` / `p256dh` /
+       * `auth` 도 함께 열리는데, 그 셋은 남의 기기로 푸시를 보낼 수 있는
+       * 자격증명입니다. 그래서 정책은 그대로 두고 이 함수로만 뚫습니다.
+       *
+       * ★ 이 함수가 절대 반환하지 않는 것 ★
+       * endpoint, p256dh, auth, expiration_time, user_agent, 시각들, 그리고
+       * **구독 개수**. 0006 은 `count(*)` 가 아니라 `exists()` 를 씁니다 —
+       * 기기를 몇 대 쓰는지도 사생활 정보입니다. 반환 컬럼이 정확히 두 개인지는
+       * 0006 의 자체 점검 블록이 `proargmodes` 로 검사하므로, 여기에 필드를
+       * 추가해도 런타임에는 오지 않습니다. 늘리지 마세요.
+       *
+       * ★ RETURNS TABLE → PostgREST 는 배열을 돌려줍니다 ★ `data[0]` 이 아니라
+       * 순회해서 Map 으로 만드세요 (lib/push-status.ts 가 그렇게 합니다).
+       *
+       * 반환 행은 "알림을 켠 사람" 이 아니라 **그 그룹의 멤버 전원**입니다.
+       * 안 켠 사람은 `has_push: false` 로 들어옵니다.
+       *
+       * 호출자가 그 그룹의 멤버가 아니거나 `p_group_id` 가 null 이면 예외가
+       * 아니라 **0행**입니다. 예외로 만들면 "그 group_id 는 실재한다" 가 새고,
+       * 진짜 조회 실패와 구분할 수도 없습니다.
+       *
+       * `anon` 에는 execute 가 revoke 되어 있습니다.
+       */
+      group_push_status: {
+        Args: { p_group_id: string }
+        Returns: {
+          user_id: string
+          /** 구독이 1건이라도 있으면 true. 개수는 알 수 없고, 알 필요도 없습니다. */
+          has_push: boolean
+        }[]
+      }
     }
     Enums: {
       [_ in never]: never
@@ -833,3 +870,12 @@ export type AutoNudgeRunRow = FunctionReturns<'run_auto_nudges'>[number]
  * ★ `data` from those calls is an ARRAY (RETURNS TABLE). Use `data[0]`. ★
  */
 export type BulkFillResult = FunctionReturns<'apply_today_templates'>[number]
+
+/**
+ * [0006] `group_push_status` 의 한 행, 배열에서 벗겨낸 것.
+ *
+ * ★ 여기도 배열입니다(RETURNS TABLE). `data[0]` 이 아니라 map 으로 쓰세요. ★
+ * 필드는 (user_id, has_push) 두 개뿐이고, 늘리면 안 됩니다 — 0006 의 자체
+ * 점검이 반환 컬럼 개수를 검사합니다.
+ */
+export type GroupPushStatusRow = FunctionReturns<'group_push_status'>[number]

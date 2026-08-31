@@ -1,8 +1,15 @@
 'use client'
 
-import { useOptimistic, useRef, useState, useTransition } from 'react'
+import { useRouter } from 'next/navigation'
+import { useCallback, useEffect, useOptimistic, useRef, useState, useTransition } from 'react'
 
 import { ErrorText, Hint } from '@/components/ui'
+import {
+  probeNetwork,
+  readTodaySnapshot,
+  saveTodaySnapshot,
+  type OfflineTask,
+} from '@/lib/offline'
 
 import { addTask, deleteTask, toggleTask } from './tasks/actions'
 // 값이 아니라 타입만 가져옵니다. lib/tasks.ts 는 next/headers 를 타고 들어가는
@@ -102,6 +109,16 @@ function codePointLength(value: string): number {
   return Array.from(value).length
 }
 
+/**
+ * 오프라인에서 쓰기를 시도했을 때의 문장.
+ *
+ * "나중에 자동으로 보낼게요" 라고 쓰지 않습니다. 이번 범위에는 쓰기 큐도
+ * 재접속 동기화도 없고, iOS Safari 는 Background Sync 를 지원하지도 않습니다.
+ * 지킬 수 없는 약속을 하고 조용히 잃는 것이 제일 나쁩니다.
+ */
+const OFFLINE_WRITE_KO =
+  '지금은 저장할 수 없어요. 인터넷에 연결된 뒤에 다시 눌러주세요.'
+
 // ---------------------------------------------------------------------------
 // 본체
 // ---------------------------------------------------------------------------
@@ -127,6 +144,40 @@ export default function TodayTasks({
   const [error, setError] = useState<string | null>(null)
   const [, startTransition] = useTransition()
 
+  const router = useRouter()
+
+  /**
+   * "지금 서버에 닿지 않는다"고 **확인된** 상태.
+   *
+   * navigator.onLine 을 그대로 믿지 않습니다. true 는 "인터페이스가 올라와
+   * 있다"는 뜻일 뿐이고, 카페 와이파이에 붙었지만 포털을 통과하지 않은 상태도
+   * true 입니다. 이 값이 true 가 되는 경로는 둘뿐입니다.
+   *   · 서버 액션 호출이 네트워크 예외로 거절됐다  (= 진짜 실패한 요청)
+   *   · navigator.onLine 이 false 다               (= 음성은 비교적 믿을 만함)
+   * 해제되는 경로도 둘뿐입니다.
+   *   · 서버 액션이 결과를 돌려줬다
+   *   · probeNetwork() 가 실제로 성공했다
+   */
+  const [offline, setOffline] = useState(false)
+
+  /**
+   * 서버가 아무것도 못 준 상태에서 저장소로 복원한 목록.
+   *
+   * ★ 이 화면에서 이 경로는 보조수단입니다 ★
+   * `/` 는 동적 SSR 이라, 네트워크가 없으면 이 컴포넌트가 마운트되는 일 자체가
+   * 없습니다 — 그 자리는 app/sw.ts 가 만들어 내는 오프라인 문서가 대신합니다.
+   * 여기 남겨 둔 것은 bfcache 복원처럼 "컴포넌트는 살아 있는데 서버 데이터가
+   * 비어 있는" 경우를 위한 것이고, 그래서 조건을 아주 좁게 겁니다:
+   * **probeNetwork() 가 실제로 실패했을 때만** 복원합니다.
+   *
+   * onLine 만 보고 복원하면, 사용자가 오늘 할 일을 전부 지운 직후에 지운
+   * 항목들이 되살아납니다. 그건 오프라인 표시보다 훨씬 나쁜 거짓말입니다.
+   */
+  const [restored, setRestored] = useState<OfflineTask[] | null>(null)
+
+  /** 복원본을 보여주는 중 = 쓰기가 불가능한 읽기 전용 모드. */
+  const readOnly = restored !== null
+
   const inputRef = useRef<HTMLInputElement>(null)
   // crypto.randomUUID() 는 보안 컨텍스트에서만 존재합니다. 임시 키는 이 렌더
   // 트리 안에서만 유일하면 되므로 카운터로 충분합니다.
@@ -144,10 +195,162 @@ export default function TodayTasks({
     setError(null)
     startTransition(async () => {
       applyOptimistic(op)
-      const result = await call()
-      if (!result.ok) setError(result.error)
+      try {
+        const result = await call()
+        // 결과가 왔다 = 서버에 닿았다. onLine 이 뭐라고 하든 이게 증거입니다.
+        setOffline(false)
+        if (!result.ok) setError(result.error)
+      } catch {
+        // 서버 액션은 실패를 값으로 돌려줍니다(lib/tasks.ts 의 ActionResult).
+        // 그러니 여기로 오는 예외는 요청 자체가 나가지 못한 경우 — 네트워크
+        // 단절입니다. 삼키면 낙관적 변경만 소리 없이 되돌아가서, 체크가
+        // "튕겨 나온" 것처럼 보입니다.
+        setOffline(true)
+        setError(OFFLINE_WRITE_KO)
+      }
     })
+    // 트랜지션이 끝나면 React 가 낙관적 상태를 버리고 props 로 되돌립니다.
+    // 오프라인이든 아니든 화면은 자동으로 진실(서버가 마지막으로 준 값)로
+    // 복구되고, 위 문장이 왜 되돌아갔는지 설명합니다.
   }
+
+  /**
+   * 마운트 시점에 저장돼 있던 스냅샷. (오늘 것이 아니면 이미 null 입니다.)
+   *
+   * ★ 왜 효과가 아니라 useState 초기화인가 ★
+   * 아래 두 효과가 저장과 복원을 모두 하는데, 효과는 선언 순서대로 돕니다.
+   * 복원 효과가 읽기 전에 저장 효과가 먼저 써 버리면 우리가 복원하려던 바로
+   * 그 값을 우리 손으로 지운 뒤에 읽게 됩니다. 초기화 함수는 첫 렌더에서
+   * 실행되므로 어떤 효과보다도 먼저입니다.
+   *
+   * 서버 렌더에서도 실행되지만 그쪽에는 localStorage 가 없어 null 이고,
+   * 이 값은 렌더 결과에 직접 쓰이지 않으므로 하이드레이션이 어긋나지 않습니다.
+   */
+  const [bootSnapshot] = useState(() => readTodaySnapshot())
+
+  /**
+   * 서버가 준 오늘 목록을 저장소에 새겨 둡니다.
+   *
+   * `tasks` 는 서버 props 입니다(낙관적 목록이 아닙니다). 즉 여기 저장되는
+   * 것은 언제나 "서버가 마지막으로 확인해 준 오늘"이고, 아직 왕복이 끝나지
+   * 않은 낙관적 변경은 절대 들어가지 않습니다.
+   *
+   * ★ 빈 목록은 여기서 저장하지 않습니다 ★
+   * 이 화면에서 빈 배열은 두 가지를 뜻할 수 있습니다 — "오늘 적은 게 없다"와
+   * "서버 데이터를 못 받았다". 둘을 구분하지 않고 덮어쓰면 두 번째 경우에
+   * 우리가 지키려던 스냅샷을 스스로 지웁니다. 그래서 빈 배열의 처리는 아래
+   * 효과가 실제 연결을 확인한 다음에 합니다.
+   *
+   * 복원본을 보여주는 중에도 저장하지 않습니다(같은 이유).
+   */
+  useEffect(() => {
+    if (readOnly) return
+    if (tasks.length === 0) return
+    saveTodaySnapshot({
+      tasks: tasks.map((task) => ({
+        id: task.id,
+        title: task.title,
+        done: task.done,
+      })),
+      groupName,
+    })
+  }, [tasks, groupName, readOnly])
+
+  /**
+   * 연결 상태 감시.
+   *
+   * 'online' 이벤트는 결론이 아니라 "확인해 볼 만하다"는 신호입니다. 실제
+   * 요청(probeNetwork)이 성공해야 온라인으로 칩니다. 성공하면 복원본을 버리고
+   * router.refresh() 로 서버에서 진짜 오늘을 다시 받아옵니다.
+   *
+   * 'offline' 이벤트의 음성은 받아들입니다. 인터페이스가 내려간 것이라 요청을
+   * 보내 봐야 실패하고, 배너를 즉시 띄우는 편이 사용자에게 정직합니다.
+   */
+  const confirmOnline = useCallback(async () => {
+    const reachable = await probeNetwork()
+    if (!reachable) {
+      setOffline(true)
+      return false
+    }
+    setOffline(false)
+    setRestored(null)
+    router.refresh()
+    return true
+  }, [router])
+
+  useEffect(() => {
+    let alive = true
+
+    function handleOffline() {
+      if (alive) setOffline(true)
+    }
+
+    function handleOnline() {
+      void confirmOnline()
+    }
+
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('offline', handleOffline)
+
+    // 마운트 시점의 상태. onLine 의 음성만 신뢰합니다 — 여기서 무조건
+    // probeNetwork() 를 부르면 멀쩡한 첫 로딩마다 요청이 하나 늘어납니다.
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      setOffline(true)
+    }
+
+    return () => {
+      alive = false
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('offline', handleOffline)
+    }
+  }, [confirmOnline])
+
+  /**
+   * 목록이 비어 있을 때만 도는 효과 — "이 빈 상태가 진짜인가"를 판정합니다.
+   *
+   * 순서가 전부입니다: **먼저 probeNetwork() 로 확인하고** 그 다음에 결정합니다.
+   *   · 서버에 닿는다  → 서버가 정말 "오늘은 없다"고 한 것. 스냅샷도 비웁니다.
+   *                      (다른 기기에서 다 지웠을 수도 있으니 여기서 정리합니다.)
+   *   · 닿지 않는다    → 오프라인. 저장해 둔 목록이 있으면 복원해서 보여줍니다.
+   *
+   * 반대로 하면(확인 없이 복원) "오늘 할 일을 전부 지웠다"와 "오프라인이라 못
+   * 받았다"를 구분하지 못해, 방금 지운 항목이 되살아납니다.
+   *
+   * 요청 한 번(HEAD, 본문 없음)이 늘지만 목록이 빈 경우에만입니다 — 하루에
+   * 아침 한 번 정도이고, 그 대가로 지운 항목이 되살아나는 일이 없습니다.
+   */
+  useEffect(() => {
+    if (tasks.length > 0) {
+      setRestored(null)
+      return
+    }
+
+    let alive = true
+    void (async () => {
+      const reachable = await probeNetwork()
+      if (!alive) return
+
+      if (reachable) {
+        setOffline(false)
+        saveTodaySnapshot({ tasks: [], groupName })
+        return
+      }
+
+      setOffline(true)
+      // 오늘 것이 아니면 bootSnapshot 이 이미 null 입니다.
+      if (bootSnapshot && bootSnapshot.tasks.length > 0) setRestored(bootSnapshot.tasks)
+    })()
+
+    return () => {
+      alive = false
+    }
+    // `tasks` 자체가 아니라 길이만 봅니다. 복원은 tasks 를 바꾸지 않으므로
+    // 이 효과가 자기 자신을 다시 부르는 경로가 없습니다(확인 요청 반복 없음).
+  }, [tasks.length, groupName, bootSnapshot])
+
+  const [restoredCount, restoredDone] = restored
+    ? [restored.length, restored.filter((task) => task.done).length]
+    : [0, 0]
 
   function handleAdd(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -189,13 +392,41 @@ export default function TodayTasks({
     run({ kind: 'remove', id: task.id }, () => deleteTask(task.id))
   }
 
-  const total = optimisticTasks.length
-  const doneCount = optimisticTasks.filter((task) => task.done).length
+  // 읽기 전용(복원) 모드에서는 진행 요약도 복원본을 봐야 합니다. 목록은
+  // 복원본인데 요약만 빈 서버 데이터를 보면 둘이 서로 다른 말을 합니다.
+  const total = readOnly ? restoredCount : optimisticTasks.length
+  const doneCount = readOnly ? restoredDone : optimisticTasks.filter((task) => task.done).length
   const allDone = total > 0 && doneCount === total
   const percent = total === 0 ? 0 : Math.round((doneCount / total) * 100)
 
   return (
     <>
+      {/* ---- 오프라인 배너 ---------------------------------------------- */}
+      {/*
+        사용자가 지금 보는 것이 최신이 아니라는 사실을 반드시 알아야 합니다.
+        진행 요약보다 위에 둡니다 — "3/5 완료"라는 숫자를 읽기 **전에**
+        그 숫자가 언제 것인지 알아야 하기 때문입니다.
+
+        role="status" + aria-live="polite" 라서 화면을 보지 않는 사용자에게도
+        전환 시점에 한 번 읽힙니다(경고음 없이).
+      */}
+      {offline && (
+        <section
+          role="status"
+          aria-live="polite"
+          className="border-line bg-surface-2 rounded-2xl border p-4"
+        >
+          <p className="text-fg text-sm font-medium">
+            <span aria-hidden="true">📴</span> 오프라인 — 마지막으로 본 내용이에요
+          </p>
+          <p className="text-muted mt-1 text-sm leading-relaxed [word-break:keep-all]">
+            {readOnly
+              ? '인터넷에 연결돼 있지 않아 저장해 둔 목록을 보여주고 있어요. 지금은 체크하거나 새로 적을 수 없어요.'
+              : '인터넷에 연결돼 있지 않아요. 화면은 마지막으로 확인한 내용이고, 지금은 저장할 수 없어요.'}
+          </p>
+        </section>
+      )}
+
       {/* ---- 진행 요약 ------------------------------------------------- */}
       <section className="border-line bg-surface rounded-2xl border p-5">
         <div className="flex items-baseline justify-between gap-3">
@@ -243,7 +474,18 @@ export default function TodayTasks({
       <section className="border-line bg-surface rounded-2xl border p-5">
         <h2 className="text-fg text-base font-semibold">할 일</h2>
 
-        {total === 0 ? (
+        {readOnly ? (
+          /*
+            복원본은 정적으로 그립니다. 체크박스도 삭제 버튼도 없습니다 —
+            누를 수 있게 해 놓고 저장이 안 되는 것보다, 이번 범위가 읽기
+            전용이라는 사실이 화면에 그대로 보이는 편이 정직합니다.
+          */
+          <ul className="mt-2 flex flex-col">
+            {(restored ?? []).map((task) => (
+              <RestoredRow key={task.id} task={task} />
+            ))}
+          </ul>
+        ) : total === 0 ? (
           <div className="flex flex-col items-center gap-2 px-2 py-8 text-center">
             <p className="text-fg text-sm font-medium">오늘 할 일이 아직 없어요</p>
             <p className="text-muted text-sm leading-relaxed [word-break:keep-all]">
@@ -265,11 +507,18 @@ export default function TodayTasks({
         )}
 
         {/* ---- 추가 폼 ------------------------------------------------- */}
-        {/*
+        {readOnly ? (
+          <div className="border-line mt-4 border-t pt-4">
+            <Hint>
+              연결되면 자동으로 최신 목록을 불러와요. 그때부터 다시 적을 수 있어요.
+            </Hint>
+          </div>
+        ) : (
+        /*
           <form action={addTaskFromForm}> 이 아니라 onSubmit 입니다. form action 은
           제출할 때마다 폼을 리셋하면서 포커스를 놓고, 낙관적 목록에 새 줄을 넣을
           자리도 없습니다. 여기서는 입력을 비우고 포커스를 유지하는 쪽이 중요합니다.
-        */}
+        */
         <form onSubmit={handleAdd} className="border-line mt-4 flex gap-2 border-t pt-4">
           <label htmlFor="new-task" className="sr-only">
             새 할 일
@@ -306,8 +555,9 @@ export default function TodayTasks({
             추가
           </button>
         </form>
+        )}
 
-        {showGroupHint && (
+        {showGroupHint && !readOnly && (
           <div className="mt-3">
             <Hint>
               새로 적는 할 일은 <strong className="text-fg">{groupName}</strong> 그룹에
@@ -317,6 +567,49 @@ export default function TodayTasks({
         )}
       </section>
     </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 복원된 한 줄 (읽기 전용)
+//
+// TaskRow 와 생김새를 맞추되 상호작용은 전부 뺐습니다. disabled 체크박스로
+// 만들지 않은 이유: 회색으로 눌리는 체크박스는 "지금은 안 되지만 곧 될 것"
+// 처럼 보입니다. 여기서는 아예 컨트롤이 아니어야 합니다.
+// ---------------------------------------------------------------------------
+
+function RestoredRow({ task }: { task: OfflineTask }) {
+  return (
+    <li className="border-line flex min-h-14 items-center gap-3 border-b py-3 last:border-b-0">
+      <span
+        aria-hidden="true"
+        className={`grid size-6 shrink-0 place-items-center rounded-md border ${
+          task.done ? 'border-accent bg-accent text-accent-fg' : 'border-line text-transparent'
+        }`}
+      >
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="3"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="m5 12.5 4.5 4.5L19 7" />
+        </svg>
+      </span>
+      <span
+        className={`min-w-0 flex-1 text-sm leading-relaxed [word-break:keep-all] ${
+          task.done ? 'text-muted line-through' : 'text-fg'
+        }`}
+      >
+        {task.title}
+        {/* 취소선은 시각적 신호일 뿐이라 스크린 리더에는 들리지 않습니다. */}
+        <span className="sr-only">{task.done ? ' (완료)' : ' (미완료)'}</span>
+      </span>
+    </li>
   )
 }
 

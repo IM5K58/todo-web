@@ -41,6 +41,27 @@ export type Json =
 export type GroupRole = 'owner' | 'member'
 export type NudgeSource = 'manual' | 'auto'
 
+/**
+ * [0004] `task_templates.weekdays` 한 칸.
+ *
+ * ★ 0 = 일요일, 6 = 토요일 ★ — PostgreSQL 의 `date_part('dow', ...)` 규약과
+ * 같습니다("dow -- The day of the week as Sunday (0) to Saturday (6)").
+ * `apply_today_templates` 가 변환 없이 `v_dow = any (tt.weekdays)` 로 바로
+ * 비교하므로, 클라이언트에서 isodow(월=1..일=7)로 만들어 보내면 일요일
+ * 템플릿이 통째로 사라지고 나머지가 하루씩 밀립니다.
+ *
+ * JS 에서 이 값을 만들 때는 `new Date(Date.UTC(y, m - 1, d)).getUTCDay()` 를
+ * 쓰세요 — 이것도 0=일요일이라 규약이 같습니다. `new Date()` 로 "오늘"을
+ * 만드는 것은 여전히 금지입니다(01:30 KST 에 어제가 됩니다).
+ *
+ * 배열은 DB 의 BEFORE 트리거(`normalize_task_template_weekdays`)가 정렬 +
+ * 중복 제거로 정규화하므로, 읽어 온 값은 항상 오름차순·중복 없음입니다.
+ * 보낼 때는 순서가 뒤죽박죽이어도 됩니다. 다만 **빈 배열은 22023 으로
+ * 거부됩니다** — "요일을 전부 끄기"는 존재하지 않는 상태이고, 잠시 쉬려면
+ * `active = false` 를 쓰라는 뜻입니다.
+ */
+export type Weekday = 0 | 1 | 2 | 3 | 4 | 5 | 6
+
 /** Why `send_nudge` refused. Maps 1:1 to the reasons the function returns. */
 export type NudgeFailureReason =
   | 'not_member'
@@ -204,6 +225,23 @@ export type Database = {
           done_at: string | null
           created_at: string
           updated_at: string
+          /**
+           * [0004] The template this task was generated from, or NULL for a
+           * hand-typed one. FK is `on delete set null`, so deleting a template
+           * leaves today's task in place with the link cut.
+           *
+           * ★ READ-ONLY FROM A CLIENT ★ 0002's column grants were deliberately
+           * NOT extended, so `template_id` is absent from `Insert` and `Update`
+           * below. `public.apply_today_templates()` is the only write path.
+           * Adding it here would type-check and then fail at runtime with
+           * `42501 permission denied for column template_id` — and if the grant
+           * were ever opened to match, a client could squat an arbitrary
+           * template id in `tasks_user_date_template_uidx` and permanently
+           * block its own template from ever applying again.
+           *
+           * SELECT *is* granted, so rendering a "반복" badge is fine.
+           */
+          template_id: string | null
         }
         Insert: {
           id?: string
@@ -248,6 +286,100 @@ export type Database = {
           },
           {
             foreignKeyName: 'tasks_group_id_fkey'
+            columns: ['group_id']
+            isOneToOne: false
+            referencedRelation: 'groups'
+            referencedColumns: ['id']
+          },
+          {
+            foreignKeyName: 'tasks_template_id_fkey'
+            columns: ['template_id']
+            isOneToOne: false
+            referencedRelation: 'task_templates'
+            referencedColumns: ['id']
+          },
+        ]
+      }
+      /**
+       * [0004] 반복 할 일 템플릿.
+       *
+       * ★ 개인 설정입니다 ★ `task_templates_select_own` 은 `user_id =
+       * auth.uid()` 라, tasks 와 달리 같은 그룹 멤버도 남의 템플릿을 한 줄도
+       * 볼 수 없습니다. "그룹 전원이 서로의 오늘을 본다"는 tasks 의 규칙을
+       * 이 테이블에 옮겨 오지 마세요.
+       *
+       * SELECT 는 테이블 전체 grant 라 `select('*')` 가 기술적으로는 통과하지만
+       * (profiles / groups 와 다른 점), 다른 조회 계층과 일관되게 컬럼을
+       * 나열하세요 — 나중에 컬럼이 늘고 grant 가 좁아지면 그때 42501 이 납니다.
+       */
+      task_templates: {
+        Row: {
+          id: string
+          user_id: string
+          /** 이 템플릿이 할 일을 만들어 넣을 그룹. */
+          group_id: string
+          title: string
+          /** DEFAULT 0. tasks 와 같은 범위(-100000..100000). */
+          sort_order: number
+          /**
+           * 0=일요일 .. 6=토요일. 읽어 온 값은 DB 트리거가 정규화해서 항상
+           * 오름차순·중복 없음이고, 길이는 1~7 입니다(빈 배열은 저장 불가).
+           */
+          weekdays: Weekday[]
+          /** false = 잠시 끔. 행을 지우는 것과 다릅니다 — 아래 주석 참고. */
+          active: boolean
+          created_at: string
+          updated_at: string
+        }
+        /**
+         * Column grant is
+         * `insert (id, user_id, group_id, title, sort_order, weekdays, active)`.
+         * `created_at`/`updated_at` are absent on purpose (백데이팅 방지).
+         *
+         * `user_id` is required rather than defaulted: the INSERT policy's
+         * WITH CHECK compares it to `auth.uid()`, so sending someone else's id
+         * is refused at the policy rather than silently accepted.
+         */
+        Insert: {
+          id?: string
+          user_id: string
+          group_id: string
+          title: string
+          sort_order?: number
+          /** 생략하면 DEFAULT '{0,1,2,3,4,5,6}' = 매일. `[]` 는 22023. */
+          weekdays?: Weekday[]
+          /** DEFAULT true. */
+          active?: boolean
+        }
+        /**
+         * Column grant is `update (group_id, title, sort_order, weekdays, active)`.
+         * `user_id` is immutable from the client, and `updated_at` is stamped by
+         * the `task_templates_set_updated_at` trigger — do not send it.
+         *
+         * ★ 템플릿을 "쉬게" 할 때는 weekdays 를 비우지 말고 active 를 false 로 ★
+         * 빈 배열은 트리거가 22023 으로 거부하고, 설령 통과하더라도 어느 요일에도
+         * 걸리지 않는 유령 템플릿이 됩니다. 그리고 행을 삭제하지도 마세요:
+         * `tasks.template_id` 가 ON DELETE SET NULL 이라 오늘 이미 만들어진 할
+         * 일의 연결이 끊기고, 같은 템플릿을 다시 만들면 부분 유니크 인덱스가
+         * 중복을 못 막습니다.
+         */
+        Update: {
+          group_id?: string
+          title?: string
+          sort_order?: number
+          weekdays?: Weekday[]
+          active?: boolean
+        }
+        Relationships: [
+          {
+            foreignKeyName: 'task_templates_user_id_fkey'
+            columns: ['user_id']
+            isOneToOne: false
+            referencedRelation: 'profiles'
+            referencedColumns: ['id']
+          },
+          {
+            foreignKeyName: 'task_templates_group_id_fkey'
             columns: ['group_id']
             isOneToOne: false
             referencedRelation: 'groups'
@@ -581,6 +713,63 @@ export type Database = {
           out_pending_count: number
         }[]
       }
+      /**
+       * [0004] SECURITY DEFINER. 오늘 요일에 해당하는 CALLER'S OWN active
+       * 템플릿을 오늘 할 일로 만듭니다.
+       *
+       * ★ INVARIANT: there is no user-identifying parameter, ever. ★ The target
+       * is always `auth.uid()`, exactly like `set_auto_nudge`. Adding a
+       * `p_user_id` turns this into a one-line primitive for stuffing tasks
+       * into somebody else's day. The database comment says the same thing.
+       *
+       * `p_group_id` is a FILTER, not a target: NULL (the default) means "every
+       * group I am still a member of". A template pointing at a group the
+       * caller has since left is skipped silently — it is not counted in either
+       * `created` or `skipped`.
+       *
+       * ★ RETURNS TABLE → PostgREST hands back an ARRAY. Read `data[0]`. ★
+       * `created` = rows actually inserted. `skipped` = candidates that were
+       * already there today, caught by `tasks_user_date_template_uidx` via
+       * `on conflict do nothing`. So a second tap is `created: 0, skipped: N` —
+       * idempotent by index, not by an application-level count-then-insert.
+       * Show `skipped` to the user: "아무 일도 안 일어난 것처럼" 보이는 성공은
+       * 고장으로 오해받습니다.
+       *
+       * "오늘"과 "오늘의 요일"은 둘 다 `current_user_local_date()` 기준입니다
+       * (서버 UTC 아님), and `task_date` is left to the column DEFAULT.
+       *
+       * Raises 42501 when no session reached Postgres.
+       */
+      apply_today_templates: {
+        Args: { p_group_id?: string | null }
+        Returns: {
+          created: number
+          skipped: number
+        }[]
+      }
+      /**
+       * [0004] SECURITY DEFINER. `p_date` 의 CALLER'S OWN 할 일 제목들을 오늘로
+       * 복사합니다. 대상은 언제나 `auth.uid()` — 인자를 추가하지 마세요.
+       *
+       * ★ RETURNS TABLE → 배열입니다. `data[0]` 을 보세요. ★
+       *
+       * 거부는 예외가 아니라 값입니다: `p_date` 가 NULL 이거나 오늘 이후(오늘
+       * 포함)면 `created: 0, skipped: 0` 이 돌아옵니다. reason 같은 필드는
+       * 없으므로, 0/0 을 "복사할 게 없었다"로 렌더링하세요.
+       *
+       * 중복 판정 단위는 btrim 한 제목이고 대소문자는 접지 않습니다. 복사본의
+       * `template_id` 는 언제나 NULL 입니다(원본의 값을 옮기면 오늘 이미 적용된
+       * 템플릿과 유니크 인덱스에서 충돌해 조용히 사라집니다).
+       *
+       * Raises 42501 when no session reached Postgres.
+       */
+      copy_tasks_from: {
+        Args: { p_date: string }
+        Returns: {
+          created: number
+          skipped: number
+        }[]
+      }
     }
     Enums: {
       [_ in never]: never
@@ -615,12 +804,15 @@ export type Profile = Tables<'profiles'>
 export type Group = Tables<'groups'>
 export type GroupMember = Tables<'group_members'>
 export type Task = Tables<'tasks'>
+export type TaskTemplate = Tables<'task_templates'>
 export type PushSubscriptionRow = Tables<'push_subscriptions'>
 export type Nudge = Tables<'nudges'>
 
 export type ProfileUpdate = TablesUpdate<'profiles'>
 export type TaskInsert = TablesInsert<'tasks'>
 export type TaskUpdate = TablesUpdate<'tasks'>
+export type TaskTemplateInsert = TablesInsert<'task_templates'>
+export type TaskTemplateUpdate = TablesUpdate<'task_templates'>
 export type PushSubscriptionInsert = TablesInsert<'push_subscriptions'>
 export type PushSubscriptionUpdate = TablesUpdate<'push_subscriptions'>
 
@@ -632,3 +824,12 @@ export type AutoNudgeSettings = FunctionReturns<'get_auto_nudge'>[number]
 
 /** One reminded user from `run_auto_nudges`. Service-role code only. */
 export type AutoNudgeRunRow = FunctionReturns<'run_auto_nudges'>[number]
+
+/**
+ * The single row `apply_today_templates` / `copy_tasks_from` return, unwrapped
+ * from their array. Both RPCs share this shape on purpose, so one piece of
+ * "N개 불러왔어요 (M개는 건너뜀)" copy can render either outcome.
+ *
+ * ★ `data` from those calls is an ARRAY (RETURNS TABLE). Use `data[0]`. ★
+ */
+export type BulkFillResult = FunctionReturns<'apply_today_templates'>[number]

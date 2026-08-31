@@ -1,10 +1,17 @@
 import Link from 'next/link'
 import { redirect } from 'next/navigation'
 
-import { Card, EmptyState, ErrorText, Hint, LinkButton } from '@/components/ui'
+import { Button, Card, EmptyState, ErrorText, Hint, LinkButton, SuccessText } from '@/components/ui'
 import { STREAK_WINDOW_DAYS, getTodayPageData } from '@/lib/tasks'
 import { createClient } from '@/lib/supabase/server'
+import type { Weekday } from '@/lib/supabase/types'
 
+import {
+  applyTemplatesAction,
+  copyTasksFromAction,
+  type FillErrCode,
+  type FillKind,
+} from './templates/actions'
 import TodayTasks, { type TodayTaskView } from './today-tasks'
 
 /**
@@ -144,6 +151,82 @@ function LoadError({ message }: { message: string }) {
 
 const READ_FAILED_KO = '잠시 문제가 생겼어요. 인터넷 연결을 확인하고 다시 시도해 주세요.'
 
+// ---------------------------------------------------------------------------
+// 오늘을 빠르게 채우기 (0004 — 반복 할 일 / 어제 것 가져오기)
+// ---------------------------------------------------------------------------
+
+/**
+ * 'YYYY-MM-DD' 에서 하루 전.
+ *
+ * ★ 여기서 Date 를 쓰는 것은 안전합니다 ★ — "지금"을 읽지 않기 때문입니다.
+ * 입력은 DB 가 이미 사용자 시간대로 계산해 준 `data.today` 이고, Date.UTC 로
+ * 순수 UTC 자정을 만들어 86400000ms 를 빼기만 합니다. 서머타임도 로컬 시간대도
+ * 개입하지 않습니다. 금지된 것은 `new Date()` 로 "오늘"을 만드는 쪽이지 날짜
+ * 산술이 아닙니다 (lib/tasks.ts 의 shiftDate 가 같은 이유로 같은 방식입니다).
+ * shiftDate 를 재사용하지 않은 것은 그게 lib/tasks.ts 의 내부 함수라서입니다.
+ */
+function previousDate(isoDate: string): string {
+  const [year, month, day] = isoDate.split('-').map(Number)
+  return new Date(Date.UTC(year, month - 1, day) - 86_400_000).toISOString().slice(0, 10)
+}
+
+/**
+ * 'YYYY-MM-DD' -> 0(일요일) ~ 6(토요일).
+ *
+ * task_templates.weekdays 의 인코딩과 같습니다 — 0004_templates.sql 이 쓰는
+ * PostgreSQL `date_part('dow', ...)` 규약이고, JS 의 getUTCDay() 도 0=일요일
+ * 입니다. isodow(월=1..일=7)로 바꾸면 일요일 템플릿이 통째로 사라집니다.
+ * 위 previousDate 와 같은 이유로 Date 사용이 안전합니다.
+ */
+function weekdayOf(isoDate: string): Weekday {
+  const [year, month, day] = isoDate.split('-').map(Number)
+  // getUTCDay() 는 정의상 0..6 이므로 이 단언은 값에 대한 거짓말이 아닙니다.
+  return new Date(Date.UTC(year, month - 1, day)).getUTCDay() as Weekday
+}
+
+/** ?c= / ?s= 는 액션이 만든 값이지만 URL 은 사용자가 고칠 수 있습니다. */
+function countParam(raw: string | string[] | undefined): number {
+  if (typeof raw !== 'string') return 0
+  const value = Number.parseInt(raw, 10)
+  if (!Number.isInteger(value) || value < 0 || value > 9999) return 0
+  return value
+}
+
+const FILL_ERR_MESSAGES: Record<FillErrCode, string> = {
+  auth: '로그인이 풀렸어요. 앱을 새로고침한 뒤 다시 시도해 주세요.',
+  badrequest: '요청이 올바르지 않아요. 화면을 새로고침한 뒤 다시 시도해 주세요.',
+  notdeployed: '이 기능이 아직 서버에 적용되지 않았어요. 잠시 후 다시 시도해 주세요.',
+  fail: '불러오지 못했어요. 잠시 후 다시 시도해 주세요.',
+}
+
+/**
+ * "3개 넣었어요 (2개는 이미 있어서 건너뜀)".
+ *
+ * ★ created 만 말하면 안 됩니다 ★ 전부 이미 있어서 0/N 이 돌아왔을 때 화면이
+ * 조용하면, 사용자는 버튼이 고장 난 줄 알고 계속 누릅니다. 0/0 도 "없었어요"
+ * 라고 분명히 말합니다.
+ *
+ * ※ app/templates/page.tsx 에도 같은 이름의 함수가 있습니다. 'use server'
+ *    파일은 async 함수 외의 export 를 허용하지 않아 actions.ts 에 둘 수 없고,
+ *    두 화면의 문구가 서로 달라도 되는 종류의 코드라 각자 소유합니다.
+ */
+function fillMessage(kind: FillKind, created: number, skipped: number): string {
+  const what = kind === 'applied' ? '반복 할 일' : '어제 할 일'
+
+  if (created === 0 && skipped === 0) {
+    return kind === 'applied'
+      ? '오늘 요일에 해당하는 반복 할 일이 없었어요.'
+      : '가져올 할 일이 없었어요.'
+  }
+  if (created === 0) {
+    return `${what} ${skipped}개가 이미 오늘 목록에 있어서 전부 건너뛰었어요.`
+  }
+  if (skipped === 0) {
+    return `${what} ${created}개를 오늘 목록에 넣었어요.`
+  }
+  return `${what} ${created}개를 넣었어요. (${skipped}개는 이미 있어서 건너뜀)`
+}
+
 /** State 3. Sits above whatever else the home screen is showing. */
 function OnboardingNudge() {
   return (
@@ -185,7 +268,25 @@ function NoGroupState({ needsOnboarding }: { needsOnboarding: boolean }) {
 // Page
 // ---------------------------------------------------------------------------
 
-export default async function TodayPage() {
+export default async function TodayPage({
+  searchParams,
+}: {
+  /**
+   * 0004 의 "오늘 채우기" 결과만 읽습니다(fill / c / s / fillerr). 그 외 파라미터는
+   * 무시하고, 이 화면의 데이터 로딩에는 아무 영향을 주지 않습니다.
+   */
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>
+}) {
+  const params = await searchParams
+
+  const fillKind =
+    params.fill === 'applied' || params.fill === 'copied' ? (params.fill as FillKind) : null
+  const fillErrMessage =
+    typeof params.fillerr === 'string' &&
+    Object.prototype.hasOwnProperty.call(FILL_ERR_MESSAGES, params.fillerr)
+      ? FILL_ERR_MESSAGES[params.fillerr as FillErrCode]
+      : null
+
   const supabase = await createClient()
 
   // getClaims() verifies the JWT signature. getSession() would just echo the
@@ -265,6 +366,74 @@ export default async function TodayPage() {
     done: task.done_at !== null,
   }))
 
+  // -------------------------------------------------------------------------
+  // 오늘을 빠르게 채우기 — 추가 조회는 "오늘이 비어 있을 때만"
+  //
+  // ★ 왜 조건부인가 (두 가지 이유) ★
+  //
+  // 1) 화면. 이미 할 일을 적어 둔 사람에게 "불러오기" 카드는 목록과 자리를 다투는
+  //    소음입니다. 하루 중 대부분의 방문이 이 상태(=목록을 확인하러 옴)이고,
+  //    그때 필요한 것은 버튼이 아니라 목록입니다. 그래서 목록이 있을 때 이 카드는
+  //    통째로 사라지고, /templates 로 가는 길만 아래 "이동" 블록에 상시로 남습니다
+  //    (거기서 언제든 "오늘 채우기"를 누를 수 있습니다).
+  //
+  // 2) 왕복. 아래 두 질의는 getTodayPageData() 의 결과(오늘 날짜)에 의존해서
+  //    같은 파에 못 넣습니다 -- 넣으려면 lib/tasks.ts 의 시그니처를 바꿔야 하고
+  //    그건 제 소유 파일이 아닙니다. 그래서 순차 왕복이 1회 늘어나는데, 그 비용을
+  //    "목록이 비어 있는" 경우에만 냅니다. 그때는 어차피 그릴 것도 적고, 이 카드가
+  //    그 화면의 유일한 내용이라 값을 치를 이유가 있습니다. 할 일이 있는 흔한
+  //    경로에서는 추가 비용이 정확히 0 입니다.
+  //    (두 질의끼리는 서로 독립이라 Promise.all 로 한 파에 넣습니다.)
+  // -------------------------------------------------------------------------
+  const showQuickFill = !tasksFailed && todayTasks.length === 0
+  const yesterday = ISO_DATE_RE.test(data.today) ? previousDate(data.today) : null
+
+  let applicableTemplateCount = 0
+  let yesterdayTaskCount = 0
+  /** 0004 가 아직 이 환경에 적용되지 않았다 (PostgREST 스키마 캐시에 테이블 없음). */
+  let quickFillUnavailable = false
+
+  if (showQuickFill && yesterday) {
+    const todayWeekday = weekdayOf(data.today)
+
+    const [templatesResult, yesterdayResult] = await Promise.all([
+      // 요일 필터를 SQL 로 보내지 않고 JS 에서 겁니다. 한 사람의 템플릿은 많아야
+      // 수십 행이고, 배열 포함(`cs`) 필터를 문자열로 조립하는 것보다 인코딩 사고가
+      // 날 여지가 없습니다.
+      supabase
+        .from('task_templates')
+        .select('weekdays')
+        .eq('user_id', userId)
+        .eq('active', true)
+        // RPC 도 "아직 가입 상태인 그룹" 만 대상으로 삼습니다. 이 필터를 빼면
+        // 나간 그룹의 템플릿까지 세어서 "3개 불러오기"라 해 놓고 1개만 들어옵니다.
+        .in(
+          'group_id',
+          data.groups.map((group) => group.id),
+        ),
+      // 어제 몇 개를 적었는지만 필요합니다. head: true 라 행은 오지 않습니다.
+      supabase
+        .from('tasks')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', userId)
+        .eq('task_date', yesterday),
+    ])
+
+    if (templatesResult.error) {
+      const code = templatesResult.error.code
+      quickFillUnavailable = code === 'PGRST205' || code === '42P01'
+      // 그 밖의 실패는 조용히 0 으로 둡니다. 이 카드는 편의 기능이고, 여기서
+      // 오류 배너를 띄우면 "오늘 할 일이 없다"는 정상 상태가 사고처럼 보입니다.
+      // (실제로 눌러서 실패하면 그때는 ?fillerr= 로 분명히 말합니다.)
+    } else {
+      applicableTemplateCount = (templatesResult.data ?? []).filter((row) =>
+        row.weekdays.includes(todayWeekday),
+      ).length
+    }
+
+    yesterdayTaskCount = yesterdayResult.error ? 0 : (yesterdayResult.count ?? 0)
+  }
+
   const headerDate = ISO_DATE_RE.test(data.today)
     ? formatKoreanDate(data.today)
     // The loader falls back to an Intl-derived date and only returns '' before
@@ -329,6 +498,85 @@ export default async function TodayPage() {
 
       {needsOnboarding && <OnboardingNudge />}
 
+      {/* ---- 채우기 결과 ------------------------------------------------ */}
+      {/*
+        ★ 조건이 searchParams 뿐이고 목록 상태가 아닌 것이 중요합니다 ★
+        불러오기가 성공하면 목록은 더 이상 비어 있지 않아서 아래 "빠르게 채우기"
+        카드는 사라집니다. 그 결과 문장까지 같이 사라지면 방금 무슨 일이
+        일어났는지 아무도 알 수 없습니다. 목록 바로 위에 두는 것은 바뀐 목록과
+        설명이 같은 화면 안에 보이게 하기 위해서입니다.
+      */}
+      {fillKind && (
+        <div className="border-line bg-surface rounded-2xl border p-4">
+          <SuccessText>
+            {fillMessage(fillKind, countParam(params.c), countParam(params.s))}
+          </SuccessText>
+        </div>
+      )}
+      {fillErrMessage && (
+        <div className="border-danger rounded-2xl border p-4">
+          <ErrorText>{fillErrMessage}</ErrorText>
+        </div>
+      )}
+
+      {/* ---- 오늘을 빠르게 채우기 --------------------------------------- */}
+      {/* 목록이 비어 있을 때만. 이유는 위 계산부의 주석 참고. */}
+      {showQuickFill && (
+        <Card title="오늘을 빠르게 채우기">
+          {quickFillUnavailable ? (
+            <Hint>
+              반복 할 일 기능이 아직 서버에 적용되지 않았어요. 잠시 후 다시 열어봐
+              주세요.
+            </Hint>
+          ) : applicableTemplateCount === 0 && yesterdayTaskCount === 0 ? (
+            <>
+              <Hint>
+                매일 반복하는 일을 한 번만 등록해두면, 아침마다 버튼 하나로 오늘
+                목록을 채울 수 있어요. 매번 같은 걸 다시 적지 않아도 돼요.
+              </Hint>
+              <LinkButton href="/templates" variant="secondary">
+                반복 할 일 만들기
+              </LinkButton>
+            </>
+          ) : (
+            <>
+              <Hint>오늘은 아직 비어 있어요. 한 번에 채워볼까요?</Hint>
+
+              {applicableTemplateCount > 0 && (
+                <form action={applyTemplatesAction}>
+                  <input type="hidden" name="from" value="/" />
+                  {/* groupId 는 보내지 않습니다 — 비우면 "내가 아직 속한 모든
+                      그룹"이 대상이고, 이 화면의 오늘 목록도 그룹을 가리지 않습니다. */}
+                  <Button type="submit" pendingLabel="불러오는 중…">
+                    반복 할 일 {applicableTemplateCount}개 불러오기
+                  </Button>
+                </form>
+              )}
+
+              {yesterdayTaskCount > 0 && yesterday && (
+                <form action={copyTasksFromAction}>
+                  <input type="hidden" name="from" value="/" />
+                  {/* 날짜는 DB 가 준 data.today 에서 하루 뺀 값입니다. 오늘/미래
+                      여부는 RPC 가 자기 기준으로 한 번 더 판정합니다. */}
+                  <input type="hidden" name="date" value={yesterday} />
+                  <Button type="submit" variant="secondary" pendingLabel="가져오는 중…">
+                    어제 적은 것 가져오기
+                  </Button>
+                </form>
+              )}
+
+              <Hint>
+                {/* 버튼 라벨에 어제 개수를 넣지 않는 이유: 어제 같은 제목이 두 번
+                    있으면 하나만 복사돼서, 라벨의 숫자가 결과보다 커집니다. */}
+                {yesterdayTaskCount > 0 ? `어제는 ${yesterdayTaskCount}개를 적었어요. ` : ''}
+                이미 오늘 목록에 있는 건 다시 만들지 않으니 여러 번 눌러도 안전해요.
+                넣은 뒤에 지우거나 고칠 수 있어요.
+              </Hint>
+            </>
+          )}
+        </Card>
+      )}
+
       {/* ---- 오늘 할 일 ------------------------------------------------ */}
       {tasksFailed ? (
         <Card title="할 일을 불러오지 못했어요">
@@ -357,6 +605,18 @@ export default async function TodayPage() {
         <LinkButton href="/status">친구들 현황 보기</LinkButton>
         <LinkButton href="/groups" variant="secondary">
           내 그룹 관리
+        </LinkButton>
+        {/*
+          반복 할 일로 가는 상시 입구.
+          /settings 아래로 넣지 않은 이유: 설정에 묻으면 아무도 못 찾습니다.
+          위의 "빠르게 채우기" 카드는 목록이 비어 있을 때만 나타나므로, 이미
+          할 일을 적어 둔 사람에게는 이 줄이 유일한 경로입니다. 하단 탭바에
+          5번째 탭을 만들지 않은 것은 기록 링크와 같은 이유입니다 — 375px 에서
+          5탭이면 한 칸이 75px 로 좁아지고, 반복 할 일은 매일 여는 화면이
+          아닙니다.
+        */}
+        <LinkButton href="/templates" variant="secondary">
+          반복 할 일 관리
         </LinkButton>
       </div>
 

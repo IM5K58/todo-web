@@ -14,6 +14,7 @@ import {
   SuccessText,
 } from '@/components/ui'
 import { requireUserId } from '@/lib/auth'
+import { Screen } from '@/components/screen'
 
 /**
  * /groups/join — 초대 코드로 참여.
@@ -105,7 +106,7 @@ export default async function JoinGroupPage({
     existing.find((group) => group.id === alreadyGroupId)?.name ?? null
 
   return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
+    <Screen>
       <PageHeader
         title="초대 코드로 참여"
         backHref="/"
@@ -179,6 +180,6 @@ export default async function JoinGroupPage({
           새로 만들기
         </Link>
       </p>
-    </main>
+    </Screen>
   )
 }

@@ -13,6 +13,7 @@ import {
   PageHeader,
 } from '@/components/ui'
 import { requireUserId } from '@/lib/auth'
+import { Screen } from '@/components/screen'
 
 /**
  * /groups/new — 그룹 만들기.
@@ -95,7 +96,7 @@ export default async function NewGroupPage({
   const hasExisting = existing.length > 0
 
   return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
+    <Screen>
       <PageHeader
         title="그룹 만들기"
         backHref="/"
@@ -178,6 +179,6 @@ export default async function NewGroupPage({
           코드로 참여하기
         </Link>
       </p>
-    </main>
+    </Screen>
   )
 }

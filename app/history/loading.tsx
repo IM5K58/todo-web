@@ -1,3 +1,5 @@
+import { Screen } from '@/components/screen'
+
 /**
  * 즉시 표시되는 스켈레톤.
  *
@@ -34,7 +36,7 @@ function CalendarSkeleton() {
 
 export default function HistoryLoading() {
   return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
+    <Screen>
       <div aria-busy="true" aria-live="polite" className="flex flex-col gap-5">
         <span className="sr-only">불러오는 중…</span>
 
@@ -60,8 +62,6 @@ export default function HistoryLoading() {
           <div className="bg-surface-2 h-3 w-3/4 rounded-sm" />
         </div>
       </div>
-
-      <div aria-hidden="true" className="h-28 shrink-0" />
-    </main>
+    </Screen>
   )
 }

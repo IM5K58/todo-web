@@ -154,8 +154,8 @@ export function SuccessText({ children }: { children?: ReactNode }) {
 
 /**
  * The standard page top: an optional back link, the title, optional copy.
- * Pair it with the page wrapper the settings screen uses:
- *   <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
+ * Pair it with <Screen> from '@/components/screen' -- the page wrapper the
+ * settings screen established, which also carries the <BottomNav> clearance.
  */
 export function PageHeader({
   title,

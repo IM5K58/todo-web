@@ -1,5 +1,6 @@
 import { redirect } from 'next/navigation'
 
+import { Screen } from '@/components/screen'
 import {
   Button,
   Card,
@@ -12,8 +13,9 @@ import {
   PageHeader,
   SuccessText,
 } from '@/components/ui'
+import { requireUserId } from '@/lib/auth'
 import { avatarAltText, resolveAvatar, type ResolvedAvatar } from '@/lib/avatar'
-import { createClient } from '@/lib/supabase/server'
+import { messageFor } from '@/lib/search-params'
 import { fetchMemberProfiles, type ProfilesReader } from '@/lib/tasks'
 import type { GroupRole } from '@/lib/supabase/types'
 
@@ -81,16 +83,6 @@ const ERR_MESSAGES: Record<GroupsErrCode, string> = {
   badrequest: '요청이 올바르지 않아요. 화면을 새로고침한 뒤 다시 시도해 주세요.',
   notmember: '이미 그 그룹의 멤버가 아니에요.',
   fail: '처리하지 못했어요. 잠시 후 다시 시도해 주세요.',
-}
-
-function messageFor<K extends string>(
-  table: Record<K, string>,
-  raw: string | string[] | undefined,
-): string | null {
-  // A repeated param arrives as an array; an unknown code must render nothing
-  // rather than an empty banner.
-  if (typeof raw !== 'string') return null
-  return Object.prototype.hasOwnProperty.call(table, raw) ? table[raw as K] : null
 }
 
 // ---------------------------------------------------------------------------
@@ -173,15 +165,8 @@ export default async function GroupsPage({
   const okMessage = messageFor<GroupsOkCode>(OK_MESSAGES, params.ok)
   const errMessage = messageFor<GroupsErrCode>(ERR_MESSAGES, params.err)
 
-  const supabase = await createClient()
-
-  // getClaims() verifies the JWT signature; getSession() would just echo the
-  // cookie back, which is not an authorization check.
-  const { data: claimsData, error: claimsError } = await supabase.auth.getClaims()
-  const userId = claimsData?.claims.sub
-  if (claimsError || typeof userId !== 'string' || !userId) {
-    redirect('/login')
-  }
+  // 세션이 없으면 여기서 /login 으로 나갑니다. 판정 근거는 lib/auth.ts 에.
+  const { supabase, userId } = await requireUserId()
 
   // ---- my memberships -----------------------------------------------------
   const { data: myMemberships, error: membershipError } = await supabase
@@ -286,7 +271,7 @@ export default async function GroupsPage({
 
   // ---- render -------------------------------------------------------------
   return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
+    <Screen>
       <PageHeader title="내 그룹" backHref="/" backLabel="오늘로 돌아가기" />
 
       {okMessage && (
@@ -486,11 +471,7 @@ export default async function GroupsPage({
           초대 코드로 참여하기
         </LinkButton>
       </Card>
-      {/* 하단 고정 탭바(56px + safe-area) 가림 방지. screen-safe 가
-          min-height:100dvh 라서 pb-28 을 쓰면 내용이 짧아도 무의미한
-          스크롤이 생긴다. 그래서 패딩이 아니라 스페이서. */}
-      <div aria-hidden="true" className="h-28 shrink-0" />
-    </main>
+    </Screen>
   )
 }
 
@@ -504,7 +485,7 @@ export default async function GroupsPage({
  */
 function LoadFailure({ message }: { message: string }) {
   return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
+    <Screen>
       <PageHeader title="내 그룹" backHref="/" backLabel="오늘로 돌아가기" />
       <Card>
         <ErrorText>{message}</ErrorText>
@@ -512,10 +493,6 @@ function LoadFailure({ message }: { message: string }) {
           다시 불러오기
         </LinkButton>
       </Card>
-      {/* 하단 고정 탭바(56px + safe-area) 가림 방지. screen-safe 가
-          min-height:100dvh 라서 pb-28 을 쓰면 내용이 짧아도 무의미한
-          스크롤이 생긴다. 그래서 패딩이 아니라 스페이서. */}
-      <div aria-hidden="true" className="h-28 shrink-0" />
-    </main>
+    </Screen>
   )
 }

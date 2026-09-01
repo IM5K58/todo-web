@@ -1,8 +1,10 @@
 import { redirect } from 'next/navigation'
 
+import { Screen } from '@/components/screen'
 import { Button, Card, EmptyState, ErrorText, Hint, LinkButton, SuccessText } from '@/components/ui'
-import { STREAK_WINDOW_DAYS, getTodayPageData } from '@/lib/tasks'
+import { requireUserId } from '@/lib/auth'
 import { createClient } from '@/lib/supabase/server'
+import { STREAK_WINDOW_DAYS, getTodayPageData } from '@/lib/tasks'
 import type { Weekday } from '@/lib/supabase/types'
 
 import GroupSwitcher from './group-switcher'
@@ -99,26 +101,6 @@ function formatKoreanDate(isoDate: string): string {
 // ---------------------------------------------------------------------------
 // Shared shell
 // ---------------------------------------------------------------------------
-
-/**
- * The page wrapper app/settings/page.tsx established, plus clearance for the
- * fixed <BottomNav> that app/layout.tsx mounts.
- *
- * The clearance is a spacer element rather than `pb-28` on the <main>, because
- * `screen-safe` already sets `padding-bottom: env(safe-area-inset-bottom)` and
- * which of the two utilities wins the cascade is not something to leave to
- * chance -- if `screen-safe` won, the last row of content would sit under a
- * 56px bar. A sibling <div> has no such ambiguity. `h-28` is the same 7rem the
- * bar's own note asks for (56px bar + home-indicator inset + breathing room).
- */
-function Screen({ children }: { children: React.ReactNode }) {
-  return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
-      {children}
-      <div aria-hidden="true" className="h-28 shrink-0" />
-    </main>
-  )
-}
 
 /**
  * A read failed. Never swallow it into an empty list — "아직 그룹이 없어요" and
@@ -378,16 +360,8 @@ export default async function TodayPage({
       ? FILL_ERR_MESSAGES[params.fillerr as FillErrCode]
       : null
 
-  const supabase = await createClient()
-
-  // getClaims() verifies the JWT signature. getSession() would just echo the
-  // cookie back, which is not an authorization check.
-  const { data: claimsData, error: claimsError } = await supabase.auth.getClaims()
-  const userId = claimsData?.claims.sub
-
-  if (claimsError || typeof userId !== 'string' || !userId) {
-    redirect('/login')
-  }
+  // 세션이 없으면 여기서 /login 으로 나갑니다. 판정 근거는 lib/auth.ts 에.
+  const { supabase, userId } = await requireUserId()
 
   const [profileResult, data, defaultGroupId] = await Promise.all([
     // NEVER .select('*') here. Migration 0003 narrowed the profiles SELECT

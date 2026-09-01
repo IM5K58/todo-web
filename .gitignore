@@ -61,3 +61,6 @@ $RECYCLE.BIN/
 
 # os -- macOS
 .DS_Store
+
+# 디자인 시안 작업 파일 (앱 코드 아님, 시드 산출물이 2.5MB)
+design/

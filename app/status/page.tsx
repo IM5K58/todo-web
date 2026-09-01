@@ -1,28 +1,27 @@
 import type { Metadata } from 'next'
-import Link from 'next/link'
 import { redirect } from 'next/navigation'
 
-import {
-  Button,
-  Card,
-  EmptyState,
-  ErrorText,
-  Hint,
-  LinkButton,
-  MemberProgressRow,
-  PageHeader,
-  SuccessText,
-} from '@/components/ui'
-import { getGroupPushStatus, isPushOff, type PushStatusMap } from '@/lib/push-status'
+import { Screen } from '@/components/screen'
+import { Card, EmptyState, ErrorText, LinkButton, PageHeader } from '@/components/ui'
+import { requireUserId } from '@/lib/auth'
+import { getGroupPushStatus, type PushStatusMap } from '@/lib/push-status'
 import { createClient } from '@/lib/supabase/server'
-import {
-  getStatusPageData,
-  type MemberTodayStatus,
-  type StatusPageData,
-} from '@/lib/tasks'
+import { getStatusPageData, type StatusPageData } from '@/lib/tasks'
 
-import { nudgeAction, type StatusErrCode, type StatusOkCode } from './actions'
-import { setDefaultGroupAction } from './default-group-actions'
+import { BoardHeader } from './board-header'
+import { GroupDetailLink } from './group-detail-link'
+import { GroupSwitcher } from './group-switcher'
+import { LoadFailure } from './load-failure'
+import { MemberList } from './member-list'
+import {
+  DEFAULT_GROUP_MESSAGES,
+  defaultGroupCode,
+  isDefaultGroupError,
+  nudgeErrMessage,
+  nudgeOkMessage,
+} from './messages'
+import { Notice } from './notice'
+import { NudgeRulesCard } from './nudge-rules-card'
 import StatusRealtime from './realtime'
 
 /**
@@ -46,6 +45,22 @@ import StatusRealtime from './realtime'
  * Everything about actually SENDING a nudge lives in ./actions.ts and, below
  * that, in `public.send_nudge`.
  *
+ * WHAT LIVES WHERE
+ * ----------------
+ * 이 파일이 데이터 계층입니다: 파라미터를 읽고, 조회를 띄우고, 리다이렉트를
+ * 결정하고, 결과를 아래 조각들에 prop 으로 내려보냅니다. 화면 조각은 전부
+ * 같은 폴더에 있고 전부 Server Component 입니다(클라이언트 경계는 예나 지금이나
+ * components/ui.tsx 의 `'use client'` 한 곳뿐입니다):
+ *
+ *   ./messages.ts            `?ok=` · `?err=` · `?dg=` 의 한국어 문구
+ *   ./notice.tsx             그 문구를 담는 배너 한 줄
+ *   ./load-failure.tsx       읽기가 실패했을 때의 화면 전체
+ *   ./board-header.tsx       그룹 이름 + 조회한 날짜
+ *   ./group-switcher.tsx     그룹 칩 + [0007] 기본 그룹 고정 토글
+ *   ./member-list.tsx        명단, 콕 찌르기 버튼, [0006] 알림 꺼둠 각주
+ *   ./group-detail-link.tsx  명단 아래 /groups 진입점
+ *   ./nudge-rules-card.tsx   콕 찌르기 규칙 카드
+ *
  * WHETHER A FRIEND HAS NOTIFICATIONS ON  [0006]
  * ---------------------------------------------
  * This used to be unknowable here, and the comment that lived at this spot said
@@ -62,9 +77,9 @@ import StatusRealtime from './realtime'
  * take the board down with it.
  *
  * So the row can now say 알림 꺼둠 BEFORE the nudge. The `sent_pushoff` notice
- * below still exists and still tells the fuller story afterwards (that the
- * friend will see it when they open the app) — the badge deliberately does not
- * repeat that sentence.
+ * in ./messages.ts still exists and still tells the fuller story afterwards
+ * (that the friend will see it when they open the app) — the badge deliberately
+ * does not repeat that sentence.
  *
  * LIVE UPDATES  [0006]
  * --------------------
@@ -79,7 +94,7 @@ import StatusRealtime from './realtime'
  * Precedence, highest first:
  *
  *   1. `?group=<uuid>`             an explicit tap on a group chip
- *   2. `profiles.default_group_id` the pin, set from the toggle below
+ *   2. `profiles.default_group_id` the pin, set from ./group-switcher.tsx
  *   3. the first group I joined    the behaviour that existed before 0007
  *
  * ★ The stale-pin case is handled by NOT handling it here. ★ A pinned group I
@@ -111,108 +126,21 @@ import StatusRealtime from './realtime'
  * ENTRY POINT TO /groups  [0007]
  * ------------------------------
  * The 그룹 tab is gone from <BottomNav>, so 내 그룹 상세 보기 under the roster
- * is now the way there. It is a plain `/groups` link with no group id attached:
- * app/groups/page.tsx renders EVERY group I am in as its own <Card> and reads
- * only `?ok=` / `?err=` — it has no notion of a "current" group to open, so a
- * query parameter would be decoration that does nothing. Read, not assumed.
+ * is now the way there — ./group-detail-link.tsx.
  */
 
 export const metadata: Metadata = {
   title: '현황',
 }
 
-// ---------------------------------------------------------------------------
-// Notice copy
-// ---------------------------------------------------------------------------
-
 /**
- * Keyed by the unions ./actions.ts exports, so adding a code there breaks this
- * file until it has Korean copy. That is the point.
+ * [0007] app/status/default-group-actions.ts 가 `import type { DefaultGroupCode }
+ * from './page'` 로 이 이름을 가져갑니다. 유니온의 정의는 ./messages.ts 로
+ * 옮겼지만, 그 파일은 이 기능이 소유하지 않은 파일이라 import 경로를 그대로
+ * 살려 둡니다. 타입 전용 re-export 라 컴파일 시점에 지워지고, 런타임 순환은
+ * 생기지 않습니다.
  */
-const OK_MESSAGES: Record<StatusOkCode, string> = {
-  sent: '콕 찔렀어요. 알림이 갔어요.',
-  sent_pushoff:
-    '콕 찔렀어요. 다만 그 친구는 아직 알림을 켜두지 않아서, 앱을 열어야 볼 수 있어요.',
-  sent_undelivered:
-    '콕 찔렀어요. 알림을 보내지는 못했어요. 그 친구가 앱을 열면 확인할 수 있어요.',
-}
-
-const ERR_MESSAGES: Record<StatusErrCode, string> = {
-  auth: '로그인이 풀렸어요. 앱을 새로고침한 뒤 다시 시도해 주세요.',
-  badrequest: '요청이 올바르지 않아요. 화면을 새로고침한 뒤 다시 시도해 주세요.',
-  notmember: '같은 그룹이 아니에요. 화면을 새로고침해 주세요.',
-  self: '자기 자신은 찌를 수 없어요.',
-  ratehour: '방금 찔렀어요. 같은 사람은 한 시간에 한 번만 찌를 수 있어요.',
-  rateday: '오늘은 이미 세 번 찔렀어요. 내일 다시 시도해 주세요.',
-  notdeployed: '찌르기 기능이 아직 서버에 적용되지 않았어요. 잠시 후 다시 시도해 주세요.',
-  fail: '찌르지 못했어요. 잠시 후 다시 시도해 주세요.',
-}
-
-/**
- * [0007] `?dg=` — the outcome of the 기본 그룹 고정 toggle.
- *
- * ★ Why a third parameter and not another `?ok=` / `?err=` code ★
- * Those two are keyed by the unions ./actions.ts exports, and that file is
- * 콕 찌르기's. Squeezing pin outcomes into them would mean either editing a
- * union this feature does not own, or accepting a code that renders as `null`
- * on the day someone reorders things. A separate parameter also means a pin and
- * a nudge can never overwrite each other's banner.
- *
- * ★ Why the type is exported ★
- * app/status/default-group-actions.ts is a `'use server'` file, and such files
- * may export nothing but async functions — the union cannot live there. So it
- * lives here and the action `import type`s it back (erased at compile time, no
- * runtime cycle). That keeps the property this codebase relies on everywhere
- * else: adding a code on one side stops the other side type-checking until it
- * has Korean copy.
- */
-export type DefaultGroupCode =
-  /** default_group_id now points at the group on screen. */
-  | 'pinned'
-  /** The pin was cleared; the first joined group opens again. */
-  | 'unpinned'
-  /** No verified session reached Postgres. */
-  | 'e_auth'
-  /** The form did not carry a usable uuid. A bug here, not user error. */
-  | 'e_badrequest'
-  /** 0007 is not on this database / not in PostgREST's schema cache yet. */
-  | 'e_notdeployed'
-  /**
-   * set_default_group raised P0002 — the UPDATE matched 0 rows because there is
-   * no `profiles` row for me at all (0001's `handle_new_user` failed and 0002's
-   * `profiles_insert_self` safety valve has not run yet). 0007 raises rather
-   * than reporting a 0-row UPDATE as success, so this must not be folded into
-   * `e_fail`: "잠시 후 다시" is the wrong advice for a state that will never fix
-   * itself on its own.
-   */
-  | 'e_noprofile'
-  /** Anything else. */
-  | 'e_fail'
-
-const DEFAULT_GROUP_MESSAGES: Record<DefaultGroupCode, string> = {
-  pinned: '이 그룹을 기본으로 고정했어요. 이제 현황을 열면 이 그룹이 먼저 보여요.',
-  unpinned: '고정을 해제했어요. 이제 처음 들어간 그룹이 먼저 보여요.',
-  e_auth: '로그인이 풀렸어요. 앱을 새로고침한 뒤 다시 시도해 주세요.',
-  e_badrequest: '요청이 올바르지 않아요. 화면을 새로고침한 뒤 다시 시도해 주세요.',
-  e_notdeployed: '기본 그룹 고정이 아직 서버에 적용되지 않았어요. 잠시 후 다시 시도해 주세요.',
-  e_noprofile: '프로필을 찾지 못했어요. 로그아웃한 뒤 다시 로그인해 주세요.',
-  e_fail: '기본 그룹을 바꾸지 못했어요. 잠시 후 다시 시도해 주세요.',
-}
-
-/** `pinned` / `unpinned` are good news; every `e_` code is not. */
-function isDefaultGroupError(code: DefaultGroupCode): boolean {
-  return code.startsWith('e_')
-}
-
-function messageFor<K extends string>(
-  table: Record<K, string>,
-  raw: string | string[] | undefined,
-): string | null {
-  // A repeated param arrives as an array; an unknown code must render nothing
-  // rather than an empty banner.
-  if (typeof raw !== 'string') return null
-  return Object.prototype.hasOwnProperty.call(table, raw) ? table[raw as K] : null
-}
+export type { DefaultGroupCode } from './messages'
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -224,14 +152,6 @@ function firstParam(raw: string | string[] | undefined): string | null {
   if (typeof raw === 'string') return raw
   if (Array.isArray(raw)) return raw[0] ?? null
   return null
-}
-
-/** The `?dg=` code, if it is one we know. Unknown codes render nothing. */
-function defaultGroupCode(raw: string | string[] | undefined): DefaultGroupCode | null {
-  if (typeof raw !== 'string') return null
-  return Object.prototype.hasOwnProperty.call(DEFAULT_GROUP_MESSAGES, raw)
-    ? (raw as DefaultGroupCode)
-    : null
 }
 
 /**
@@ -314,214 +234,6 @@ async function getDefaultGroupId(userId: string): Promise<string | null> {
   return typeof value === 'string' && UUID_RE.test(value) ? value : null
 }
 
-/**
- * '2026-08-30' -> '8월 30일 토요일'.
- *
- * Formats the DATE STRING the query actually used, never `new Date()`, so the
- * header cannot disagree with the rows under it. Rendered as a UTC instant on
- * purpose: the string is already a calendar date in the user's own timezone, so
- * re-projecting it through any zone would shift it by a day.
- */
-function formatBoardDate(isoDate: string): string {
-  const [rawYear, rawMonth, rawDay] = isoDate.split('-')
-  const year = Number(rawYear)
-  const month = Number(rawMonth)
-  const day = Number(rawDay)
-
-  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
-    return isoDate
-  }
-
-  return new Intl.DateTimeFormat('ko-KR', {
-    timeZone: 'UTC',
-    month: 'long',
-    day: 'numeric',
-    weekday: 'long',
-  }).format(new Date(Date.UTC(year, month - 1, day)))
-}
-
-/** Why a member's 콕 찌르기 button is not on offer right now. */
-type NudgeBlock = 'self' | 'complete' | null
-
-function blockFor(member: MemberTodayStatus): NudgeBlock {
-  // 자기 자신에게는 버튼이 아예 없습니다. send_nudge 가 self_nudge 로 거절하고
-  // (0003 §8), 그 아래 nudges_no_self_nudge_chk CHECK 이 한 번 더 막습니다.
-  if (member.isMe) return 'self'
-  // 다 끝낸 사람은 찌를 이유가 없습니다.
-  if (member.total > 0 && member.done >= member.total) return 'complete'
-  // [0005] 횟수 제한 해제. 예전에는 여기서 시간당 1회 / 하루 3회를 세어 버튼을
-  // 감췄지만, send_nudge 의 상수가 0(무제한)이 된 뒤로는 화면만 막는 꼴이 된다.
-  // 되살리려면 0005 의 c_hourly_limit / c_daily_limit 와 이 검사를 함께 되돌릴 것.
-  return null
-}
-
-// ---------------------------------------------------------------------------
-// Presentation pieces
-// ---------------------------------------------------------------------------
-
-/**
- * Page wrapper + clearance for the fixed <BottomNav> (56px tall plus the iOS
- * home-indicator inset).
- *
- * The clearance is a spacer element rather than `pb-28` on the <main>, for the
- * reason app/page.tsx already documents: `screen-safe` also sets
- * `padding-bottom`, and which of the two utilities wins the cascade is not
- * something to leave to chance. A sibling <div> has no such ambiguity.
- */
-function Screen({ children }: { children: React.ReactNode }) {
-  return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
-      {children}
-      <div aria-hidden="true" className="h-28 shrink-0" />
-    </main>
-  )
-}
-
-/**
- * A read failed. Deliberately NOT an empty state: "아무도 안 적었어요" for a
- * query that errored is a lie, and it is precisely the lie that would send
- * someone off to nudge a friend who had in fact already finished.
- */
-function LoadFailure({ message }: { message: string }) {
-  return (
-    <Screen>
-      <PageHeader title="오늘 현황" backHref="/" backLabel="오늘로 돌아가기" />
-      <Card>
-        <ErrorText>{message}</ErrorText>
-        {/*
-          A plain <a>, not <Link>: a client-side navigation to the route we are
-          already on can be served from the Router Cache without re-running the
-          query, which would make the retry a no-op exactly when it matters.
-        */}
-        <a
-          href="/status"
-          className="border-line bg-surface text-fg inline-flex h-12 w-full shrink-0 items-center justify-center rounded-xl border px-4 text-base font-medium transition active:scale-[0.99]"
-        >
-          다시 불러오기
-        </a>
-      </Card>
-    </Screen>
-  )
-}
-
-/** The pill that stands in for the button when there is nothing to press. */
-function Pill({ tone, children }: { tone: 'accent' | 'muted'; children: React.ReactNode }) {
-  const base = 'inline-flex h-8 shrink-0 items-center rounded-full px-3 text-xs font-medium'
-  return (
-    <span
-      className={
-        tone === 'accent'
-          ? `bg-accent text-accent-fg ${base}`
-          : `border-line text-muted border ${base}`
-      }
-    >
-      {children}
-    </span>
-  )
-}
-
-/**
- * [0006] "알림 꺼둠" — a small auxiliary marker under a member row.
- *
- * ★ Why it is NOT in MemberProgressRow's `action` slot ★
- * That slot already holds either the 콕 찌르기 button or the 다 했어요 pill, and
- * those two are the point of the row. A third thing elbowing in there would
- * shrink the name and the progress bar on a 360px screen to buy space for a
- * detail nobody came for. `note` is no good either — it only renders when the
- * member has zero tasks, and "wrote nothing" and "notifications off" are
- * independent facts that can both be true.
- *
- * So it goes on its own line inside the <li>, indented to line up with the text
- * column (40px avatar + 12px gap = 52px = pl-13). It reads as a footnote to the
- * row above it, which is exactly its weight.
- *
- * ★ What it must never say ★ How many devices, which device, when. 0006 folds
- * all of that into one boolean on purpose. And it does not re-explain what
- * happens if you nudge this person anyway — OK_MESSAGES.sent_pushoff above
- * already says that, at the moment it actually matters.
- */
-function PushOffNote({ name, isSelf }: { name: string; isSelf: boolean }) {
-  return (
-    <p className="text-muted -mt-1 pb-3 pl-13 text-xs [word-break:keep-all]">
-      {isSelf ? (
-        <>
-          {/*
-            자기 자신에게는 사실 통보가 아니라 다음 행동을 줍니다. 여기서
-            "내가 안 켰다"를 알게 되는 것 자체가 /settings 로 갈 유일한 계기고,
-            그렇지 않으면 이 화면은 남의 상태만 알려주고 끝납니다.
-          */}
-          <span className="mr-1">알림 꺼둠</span>
-          <Link href="/settings" className="text-fg underline underline-offset-4">
-            알림 켜러 가기
-          </Link>
-        </>
-      ) : (
-        <>
-          {/* 이름을 눈에는 반복하지 않되, 스크린 리더에는 어느 행의 각주인지
-              들려줍니다. 시각적으로는 바로 위 행이 곧 맥락입니다. */}
-          <span className="sr-only">{name}님은 </span>알림 꺼둠
-        </>
-      )}
-    </p>
-  )
-}
-
-/**
- * [0007] "이 그룹을 먼저 보여줘" — 기본 그룹 고정 토글.
- *
- * ★ Why a <form> and not a checkbox or a <Link> ★
- * A checkbox would need client state and would report success before the write
- * landed; a <Link> would make a GET that mutates. This is a Server Action form,
- * so <Button> gets a real pending label from useFormStatus(), it works without
- * JS, and the outcome comes back as a URL you can reload (`?dg=`).
- *
- * ★ Why the state is a <p> and only the verb is a button ★
- * "고정됨" as a button label reads as the thing the button will DO, which is the
- * opposite of what pressing it does. So the current state is stated in text and
- * the button carries the action — 기본으로 고정 / 고정 해제. Nobody has to guess
- * which of the two meanings the label is carrying.
- *
- * ★ Why `pin` is a separate hidden field ★
- * `groupId` is always the group on screen, in both directions, because the
- * action redirects back to it either way. See default-group-actions.ts.
- *
- * Rendered only when there is more than one group — the caller enforces that.
- */
-function DefaultGroupToggle({ groupId, isPinned }: { groupId: string; isPinned: boolean }) {
-  return (
-    <form
-      action={setDefaultGroupAction}
-      className="border-line bg-surface flex items-center justify-between gap-3 rounded-2xl border px-4 py-3"
-    >
-      <input type="hidden" name="groupId" value={groupId} />
-      <input type="hidden" name="pin" value={isPinned ? '0' : '1'} />
-
-      <p className="text-muted min-w-0 text-xs leading-relaxed [word-break:keep-all]">
-        {isPinned ? (
-          <>
-            <span className="text-fg font-medium">기본 그룹으로 고정됨</span>
-            <br />현황을 열면 이 그룹이 먼저 보여요.
-          </>
-        ) : (
-          <>
-            <span className="text-fg font-medium">기본 그룹 아님</span>
-            <br />고정해 두면 현황을 열 때 이 그룹이 먼저 보여요.
-          </>
-        )}
-      </p>
-
-      <Button
-        type="submit"
-        size="sm"
-        variant="secondary"
-        pendingLabel={isPinned ? '해제하는 중…' : '고정하는 중…'}
-      >
-        {isPinned ? '고정 해제' : '기본으로 고정'}
-      </Button>
-    </form>
-  )
-}
-
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -532,8 +244,8 @@ export default async function StatusPage({
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>
 }) {
   const params = await searchParams
-  const okMessage = messageFor<StatusOkCode>(OK_MESSAGES, params.ok)
-  const errMessage = messageFor<StatusErrCode>(ERR_MESSAGES, params.err)
+  const okMessage = nudgeOkMessage(params.ok)
+  const errMessage = nudgeErrMessage(params.err)
 
   const dgCode = defaultGroupCode(params.dg)
 
@@ -550,13 +262,9 @@ export default async function StatusPage({
    * JWKS 는 auth-js 의 모듈 전역에 10분 캐시되므로, 따뜻한 인스턴스에서는
    * 네트워크가 나가지 않습니다(lib/tasks.ts 의 getSessionUserId 주석 참고).
    * getSession() 은 쿠키를 그대로 되돌려줄 뿐 검증이 아니라서 쓰지 않습니다.
+   * (같은 여섯 줄이 여섯 화면에 있었습니다 — 지금은 lib/auth.ts 한 곳입니다.)
    */
-  const supabase = await createClient()
-  const { data: claimsData, error: claimsError } = await supabase.auth.getClaims()
-  const claimedUserId = claimsData?.claims.sub
-  if (claimsError || typeof claimedUserId !== 'string' || !claimedUserId) {
-    redirect('/login')
-  }
+  const { userId: claimedUserId } = await requireUserId()
 
   /**
    * 고정 그룹과 보드. 순서가 두 갈래인 이유는 getDefaultGroupId() 주석에 있고,
@@ -591,7 +299,6 @@ export default async function StatusPage({
   }
 
   const activeGroup = board.activeGroup
-  const userId = board.userId
 
   /**
    * [0007] 지금 보고 있는 그룹이 곧 고정된 그룹인가.
@@ -656,10 +363,7 @@ export default async function StatusPage({
 
       <PageHeader title="오늘 현황" backHref="/" backLabel="오늘로 돌아가기" />
 
-      <header className="flex flex-col gap-1">
-        <p className="text-fg truncate text-base font-semibold">{activeGroup.name}</p>
-        <p className="text-muted text-sm tabular-nums">{formatBoardDate(board.today)}</p>
-      </header>
+      <BoardHeader groupName={activeGroup.name} today={board.today} />
 
       {/*
         그룹이 여러 개일 때만. 하나뿐이면 고를 것도, [0007] 고정할 것도 없습니다
@@ -667,41 +371,15 @@ export default async function StatusPage({
         버튼이 됩니다. 그래서 칩과 토글이 같은 조건을 공유합니다.
       */}
       {board.groups.length > 1 && (
-        <div className="flex flex-col gap-3">
-          <nav aria-label="그룹 고르기" className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
-            {board.groups.map((group) => {
-              const active = group.id === activeGroup.id
-              return (
-                <Link
-                  key={group.id}
-                  href={`/status?group=${group.id}`}
-                  aria-current={active ? 'page' : undefined}
-                  className={`inline-flex h-11 shrink-0 items-center rounded-full px-4 text-sm font-medium transition active:scale-[0.99] ${
-                    active
-                      ? 'bg-accent text-accent-fg'
-                      : 'border-line bg-surface text-muted border'
-                  }`}
-                >
-                  {group.name}
-                </Link>
-              )
-            })}
-          </nav>
-
-          <DefaultGroupToggle groupId={activeGroup.id} isPinned={isPinned} />
-        </div>
+        <GroupSwitcher
+          groups={board.groups}
+          activeGroupId={activeGroup.id}
+          isPinned={isPinned}
+        />
       )}
 
-      {okMessage && (
-        <div className="border-line bg-surface rounded-2xl border p-4">
-          <SuccessText>{okMessage}</SuccessText>
-        </div>
-      )}
-      {errMessage && (
-        <div className="border-danger rounded-2xl border p-4">
-          <ErrorText>{errMessage}</ErrorText>
-        </div>
-      )}
+      {okMessage && <Notice tone="ok">{okMessage}</Notice>}
+      {errMessage && <Notice tone="error">{errMessage}</Notice>}
 
       {/*
         [0007] 고정 결과. 콕 찌르기 배너와 같은 모양이지만 파라미터가 달라
@@ -709,16 +387,11 @@ export default async function StatusPage({
         주고 있으므로, 이 문장은 "무엇이 바뀌었는지" 만 말하고 상태를 다시
         선언하지 않습니다.
       */}
-      {dgCode &&
-        (isDefaultGroupError(dgCode) ? (
-          <div className="border-danger rounded-2xl border p-4">
-            <ErrorText>{DEFAULT_GROUP_MESSAGES[dgCode]}</ErrorText>
-          </div>
-        ) : (
-          <div className="border-line bg-surface rounded-2xl border p-4">
-            <SuccessText>{DEFAULT_GROUP_MESSAGES[dgCode]}</SuccessText>
-          </div>
-        ))}
+      {dgCode && (
+        <Notice tone={isDefaultGroupError(dgCode) ? 'error' : 'ok'}>
+          {DEFAULT_GROUP_MESSAGES[dgCode]}
+        </Notice>
+      )}
 
       <Card>
         {members.length === 0 ? (
@@ -741,101 +414,23 @@ export default async function StatusPage({
               </p>
             )}
 
-            <ul className={`flex flex-col ${boardIsEmpty ? 'border-line border-t pt-1' : ''}`}>
-              {members.map((member) => {
-                const block = blockFor(member)
-                // `=== false` 로 좁힌 판정입니다(isPushOff). `!get(id)` 로 쓰면
-                // 조회가 실패한 날 전원에게 "알림 꺼둠" 이 붙습니다.
-                const pushOff = isPushOff(pushStatuses, member.userId)
-
-                return (
-                  /*
-                    The divider lives on the <li>, not on MemberProgressRow: the
-                    row's own `border-b last:border-b-0` sees itself as the last
-                    child of its <li> every time, so it would never draw.
-                    (app/groups/page.tsx does the same with ListRow.)
-                  */
-                  <li
-                    key={member.userId}
-                    className="border-line flex flex-col border-b last:border-b-0"
-                  >
-                    <MemberProgressRow
-                      emoji={member.avatarEmoji}
-                      name={member.displayName}
-                      isSelf={member.isMe}
-                      done={member.done}
-                      total={member.total}
-                      action={
-                        block === 'self' ? undefined : block === 'complete' ? (
-                          <Pill tone="accent">다 했어요</Pill>
-                        ) : (
-                          <form action={nudgeAction}>
-                            <input type="hidden" name="groupId" value={activeGroup.id} />
-                            <input type="hidden" name="userId" value={member.userId} />
-                            <Button
-                              type="submit"
-                              size="sm"
-                              variant="secondary"
-                              pendingLabel="찌르는 중…"
-                            >
-                              콕 찌르기
-                            </Button>
-                          </form>
-                        )
-                      }
-                    />
-                    {pushOff && (
-                      <PushOffNote name={member.displayName} isSelf={member.isMe} />
-                    )}
-                  </li>
-                )
-              })}
-            </ul>
+            <MemberList
+              members={members}
+              groupId={activeGroup.id}
+              pushStatuses={pushStatuses}
+              boardIsEmpty={boardIsEmpty}
+            />
           </>
         )}
 
         {/*
-          [0007] 하단 탭에서 그룹 탭이 사라졌으므로, /groups 로 가는 길은 이제
-          여기입니다. 멤버 목록 "아래" 이고 카드 안입니다 — 초대 코드도 내보내기도
-          그룹 나가기도 전부 이 명단에 대한 이야기라서, 명단에서 멀어질수록 무슨
-          화면으로 가는지 알기 어려워집니다.
-
-          로스터 조회가 실패한 경우에도 일부러 남겨 둡니다. 그때야말로 /groups 가
-          유일한 탈출구인데 오류 분기 안에 숨겨 두면 막다른 길이 됩니다. 그래서
-          위 삼항 밖에 있습니다.
-
-          쿼리 없는 맨 /groups 입니다. app/groups/page.tsx 는 내가 속한 그룹을
-          전부 카드로 그리고 `?ok=` / `?err=` 만 읽습니다 — "지금 보는 그룹"
-          이라는 개념 자체가 없어서 `?group=` 을 붙여도 아무 일도 일어나지
-          않습니다. 읽고 확인한 것이지 짐작이 아닙니다.
+          로스터 조회가 실패해도 /groups 진입점은 남습니다 — 그래서 위 삼항
+          "밖" 입니다. 이유는 ./group-detail-link.tsx 에 적어 두었습니다.
         */}
-        <div className="border-line flex flex-col gap-3 border-t pt-4">
-          <LinkButton href="/groups" variant="secondary">
-            내 그룹 상세 보기
-          </LinkButton>
-          <Hint>초대 코드, 멤버 내보내기, 그룹 나가기를 여기에서 할 수 있어요.</Hint>
-        </div>
+        <GroupDetailLink />
       </Card>
 
-      <Card title="콕 찌르기 규칙">
-        <Hint>
-          횟수 제한 없이 찌를 수 있어요. 다만 상대가 알림을 켜두지 않았다면 알림은 가지
-          않고, 그 친구가 앱을 열었을 때만 보여요.
-        </Hint>
-        {/*
-          [0007] 여기 있던 "멤버 관리" (→ /groups) 는 지웠습니다. 같은 목적지로
-          가는 버튼이 한 화면에 둘이면 둘 다 덜 믿음직해 보이고, 그룹 얘기는
-          멤버 명단 바로 아래에 있는 쪽이 맞습니다.
-
-          "내 알림 설정" 은 남깁니다. 알림 설정의 주 진입점은 이제 마이페이지
-          이지만, 이 카드는 방금 "상대가 알림을 켜두지 않았다면" 을 설명한
-          참이고 위쪽 행에는 내 이름 밑에 알림 꺼둠 각주가 붙어 있을 수도
-          있습니다. 그 맥락에서 한 번에 갈 수 있는 것이 중복보다 낫습니다.
-        */}
-        <LinkButton href="/settings" variant="secondary">
-          내 알림 설정
-        </LinkButton>
-      </Card>
+      <NudgeRulesCard />
     </Screen>
   )
 }

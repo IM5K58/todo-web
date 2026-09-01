@@ -1,6 +1,5 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
-import { redirect } from 'next/navigation'
 
 import { joinGroupAction } from '@/app/groups/actions'
 import {
@@ -14,7 +13,7 @@ import {
   PageHeader,
   SuccessText,
 } from '@/components/ui'
-import { createClient } from '@/lib/supabase/server'
+import { requireUserId } from '@/lib/auth'
 
 /**
  * /groups/join — 초대 코드로 참여.
@@ -69,13 +68,8 @@ export default async function JoinGroupPage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>
 }) {
-  const supabase = await createClient()
-
-  const { data: claimsData, error: claimsError } = await supabase.auth.getClaims()
-  const userId = claimsData?.claims.sub
-  if (claimsError || typeof userId !== 'string' || !userId) {
-    redirect('/login?next=%2Fgroups%2Fjoin')
-  }
+  // 로그인 뒤 돌아올 곳이 홈이 아니라 이 화면이어야 해서 ?next= 를 붙입니다.
+  const { supabase, userId } = await requireUserId('/login?next=%2Fgroups%2Fjoin')
 
   const params = await searchParams
   const errorMessage = ERRORS[one(params.e) ?? ''] ?? null

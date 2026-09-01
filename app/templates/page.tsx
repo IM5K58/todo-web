@@ -1,5 +1,4 @@
-import { redirect } from 'next/navigation'
-
+import { Screen } from '@/components/screen'
 import {
   Button,
   Card,
@@ -13,7 +12,8 @@ import {
   PageHeader,
   SuccessText,
 } from '@/components/ui'
-import { createClient } from '@/lib/supabase/server'
+import { requireUserId } from '@/lib/auth'
+import { messageFor } from '@/lib/search-params'
 import { TASK_TITLE_MAX, getLocalToday, getMyGroups } from '@/lib/tasks'
 import type { Weekday } from '@/lib/supabase/types'
 
@@ -135,16 +135,6 @@ const FILL_ERR_MESSAGES: Record<FillErrCode, string> = {
   fail: '불러오지 못했어요. 잠시 후 다시 시도해 주세요.',
 }
 
-function messageFor<K extends string>(
-  table: Record<K, string>,
-  raw: string | string[] | undefined,
-): string | null {
-  // 같은 파라미터가 두 번 오면 배열입니다. 모르는 코드는 빈 배너 대신 아무것도
-  // 그리지 않아야 합니다.
-  if (typeof raw !== 'string') return null
-  return Object.prototype.hasOwnProperty.call(table, raw) ? table[raw as K] : null
-}
-
 /** ?c= / ?s= 는 액션이 만든 값이지만 URL 은 사용자가 고칠 수 있습니다. */
 function countParam(raw: string | string[] | undefined): number {
   if (typeof raw !== 'string') return 0
@@ -230,7 +220,7 @@ function WeekdayChips({ selected }: { selected: readonly Weekday[] }) {
 /** 읽기 실패. 빈 목록으로 삼키지 않습니다 — 완전히 다른 사건입니다. */
 function LoadFailure({ message }: { message: string }) {
   return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
+    <Screen>
       <PageHeader title="반복 할 일" backHref="/" backLabel="오늘로 돌아가기" />
       <Card>
         <ErrorText>{message}</ErrorText>
@@ -244,8 +234,7 @@ function LoadFailure({ message }: { message: string }) {
           다시 불러오기
         </a>
       </Card>
-      <div aria-hidden="true" className="h-28 shrink-0" />
-    </main>
+    </Screen>
   )
 }
 
@@ -266,15 +255,8 @@ export default async function TemplatesPage({
   const fillKind =
     params.fill === 'applied' || params.fill === 'copied' ? (params.fill as FillKind) : null
 
-  const supabase = await createClient()
-
-  // getClaims() 는 JWT 서명을 검증합니다. getSession() 은 쿠키를 그대로 되돌려
-  // 줄 뿐이라 인가 검사가 아닙니다.
-  const { data: claimsData, error: claimsError } = await supabase.auth.getClaims()
-  const userId = claimsData?.claims.sub
-  if (claimsError || typeof userId !== 'string' || !userId) {
-    redirect('/login')
-  }
+  // 세션이 없으면 여기서 /login 으로 나갑니다. 판정 근거는 lib/auth.ts 에.
+  const { supabase, userId } = await requireUserId()
 
   /**
    * 셋 다 서로를 기다리지 않습니다. 순차로 await 하면 화면이 뜨기까지 왕복이
@@ -331,7 +313,7 @@ export default async function TemplatesPage({
         )
 
   return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
+    <Screen>
       <PageHeader
         title="반복 할 일"
         backHref="/"
@@ -578,11 +560,6 @@ export default async function TemplatesPage({
           </form>
         )}
       </Card>
-
-      {/* 하단 고정 탭바(56px + safe-area) 가림 방지. screen-safe 가
-          min-height:100dvh 라서 pb-28 을 쓰면 내용이 짧아도 무의미한 스크롤이
-          생긴다. 그래서 패딩이 아니라 스페이서. */}
-      <div aria-hidden="true" className="h-28 shrink-0" />
-    </main>
+    </Screen>
   )
 }

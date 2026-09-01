@@ -1,3 +1,5 @@
+import { Screen } from '@/components/screen'
+
 /**
  * 즉시 표시되는 스켈레톤.
  *
@@ -34,7 +36,7 @@ function TemplateRowSkeleton() {
 
 export default function TemplatesLoading() {
   return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
+    <Screen>
       <div aria-busy="true" aria-live="polite" className="flex flex-col gap-5">
         <span className="sr-only">불러오는 중…</span>
 
@@ -64,11 +66,6 @@ export default function TemplatesLoading() {
           <div className="bg-surface-2 h-12 w-full rounded-xl" />
         </div>
       </div>
-
-      {/* 하단 고정 탭바(56px + safe-area) 가림 방지. screen-safe 가
-          min-height:100dvh 라서 pb-28 을 쓰면 내용이 짧아도 무의미한 스크롤이
-          생긴다. 그래서 패딩이 아니라 스페이서. */}
-      <div aria-hidden="true" className="h-28 shrink-0" />
-    </main>
+    </Screen>
   )
 }

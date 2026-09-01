@@ -1,6 +1,5 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
-import { redirect } from 'next/navigation'
 
 import { createGroupAction } from '@/app/groups/actions'
 import {
@@ -13,7 +12,7 @@ import {
   ListRow,
   PageHeader,
 } from '@/components/ui'
-import { createClient } from '@/lib/supabase/server'
+import { requireUserId } from '@/lib/auth'
 
 /**
  * /groups/new — 그룹 만들기.
@@ -58,13 +57,8 @@ export default async function NewGroupPage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>
 }) {
-  const supabase = await createClient()
-
-  const { data: claimsData, error: claimsError } = await supabase.auth.getClaims()
-  const userId = claimsData?.claims.sub
-  if (claimsError || typeof userId !== 'string' || !userId) {
-    redirect('/login?next=%2Fgroups%2Fnew')
-  }
+  // 로그인 뒤 돌아올 곳이 홈이 아니라 이 화면이어야 해서 ?next= 를 붙입니다.
+  const { supabase, userId } = await requireUserId('/login?next=%2Fgroups%2Fnew')
 
   const errorCode = one((await searchParams).e) ?? ''
   const fieldError = FIELD_ERRORS[errorCode] ?? null

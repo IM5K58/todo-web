@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useCallback, useEffect, useState } from 'react'
 
+import { Screen } from '@/components/screen'
 import {
   SUBSCRIBE_MESSAGES_KO,
   UNSUBSCRIBE_MESSAGES_KO,
@@ -431,7 +432,7 @@ export default function SettingsPage() {
   const autoReady = autoLoad.kind === 'ready'
 
   return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
+    <Screen>
       <header className="flex flex-col gap-1">
         <Link href="/" className="text-muted text-sm underline-offset-4 hover:underline">
           ← 오늘로 돌아가기
@@ -647,10 +648,6 @@ export default function SettingsPage() {
           </>
         )}
       </Section>
-      {/* 하단 고정 탭바(56px + safe-area) 가림 방지. screen-safe 가
-          min-height:100dvh 라서 pb-28 을 쓰면 내용이 짧아도 무의미한
-          스크롤이 생긴다. 그래서 패딩이 아니라 스페이서. */}
-      <div aria-hidden="true" className="h-28 shrink-0" />
-    </main>
+    </Screen>
   )
 }

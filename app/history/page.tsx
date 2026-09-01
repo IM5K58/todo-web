@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import Link from 'next/link'
 import { redirect } from 'next/navigation'
 
+import { Screen } from '@/components/screen'
 import { Card, ErrorText, Hint, LinkButton, PageHeader } from '@/components/ui'
 import {
   STREAK_WINDOW_DAYS,
@@ -101,23 +102,6 @@ const CELL_BASE =
 // ---------------------------------------------------------------------------
 // 레이아웃 조각
 // ---------------------------------------------------------------------------
-
-/**
- * 페이지 껍데기 + 하단 고정 탭바(56px + 홈 인디케이터) 여백.
- *
- * 여백은 <main> 의 pb-28 이 아니라 스페이서 <div> 입니다. screen-safe 가
- * padding-bottom 을 이미 걸어 두기 때문에 둘 중 무엇이 캐스케이드에서 이기는지를
- * 운에 맡길 수 없습니다. 형제 <div> 에는 그런 모호함이 없습니다.
- * (app/page.tsx · app/status/page.tsx 와 같은 근거)
- */
-function Screen({ children }: { children: React.ReactNode }) {
-  return (
-    <main className="screen-safe px-safe mx-auto flex w-full max-w-md flex-col gap-5 py-6">
-      {children}
-      <div aria-hidden="true" className="h-28 shrink-0" />
-    </main>
-  )
-}
 
 /**
  * 조회가 실패했습니다. 빈 달력으로 삼키지 않습니다 — "기록이 없어요"와

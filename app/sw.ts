@@ -1,7 +1,6 @@
 import {
   CacheFirst,
-  ExpirationPlugin,
-  NetworkOnly,
+  ExpirationPlugin,
   Serwist,
   StaleWhileRevalidate,
   type RuntimeCaching,
@@ -669,11 +668,21 @@ const runtimeCaching: RuntimeCaching[] = [
       ],
     }),
   },
-  {
-    // 나머지 전부: HTML, RSC, /api, /auth, 교차 출처. 캐시하지 않습니다.
-    matcher: () => true,
-    handler: new NetworkOnly(),
-  },
+  // [수정] catch-all NetworkOnly 를 제거했습니다.
+  //
+  // 원래 의도("로그인한 사용자의 HTML 을 절대 캐시하지 않는다")는 옳습니다.
+  // 하지만 NetworkOnly 는 네트워크가 한 번 실패하면 폴백 없이 no-response 를
+  // 던집니다. 그 그물에 Next 의 RSC 페이로드 요청까지 걸려서, 배포 직후처럼
+  // 요청이 한 번 삐끗하는 순간 React 가 화면을 못 그리고 통째로 죽었습니다
+  // (Minified React error #441 + NetworkOnly.ts no-response).
+  //
+  // 매칭하지 않으면 같은 목적을 달성하면서 이 실패 모드가 사라집니다.
+  // 서비스워커가 처리하지 않은 요청은 브라우저가 평소대로 네트워크로 보내고,
+  // 당연히 아무것도 캐시되지 않습니다. 가로채는 층을 하나 없애는 것이지
+  // 캐시 정책을 느슨하게 하는 것이 아닙니다.
+  //
+  // ⚠️ 여기에 다시 catch-all 을 넣지 마세요. 넣으려면 반드시 폴백이 있는
+  //    전략이어야 하고, 인증된 HTML 이 캐시에 들어가지 않는지 먼저 확인해야 합니다.
 ]
 
 /**

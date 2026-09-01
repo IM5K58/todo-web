@@ -4,6 +4,11 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useCallback, useEffect, useState } from 'react'
 
+import {
+  loadNudgeMessage,
+  saveNudgeMessage,
+  type NudgeMessageErrorCode,
+} from '@/app/settings/nudge-message-actions'
 import { Screen } from '@/components/screen'
 import {
   SUBSCRIBE_MESSAGES_KO,
@@ -31,6 +36,11 @@ import { createClient } from '@/lib/supabase/client'
  *      is self-targeted by construction: `set_auto_nudge` takes no user id and
  *      writes `auth.uid()`'s own row, so there is no way to schedule a
  *      notification at somebody else. The copy below says so out loud.
+ *
+ * Section 3 (콕 찌르기 메시지) is neither of those. It is about what MY nudge
+ * says on somebody ELSE's phone, so it is deliberately placed last and worded
+ * as an outgoing setting — filing it next to the two incoming switches above is
+ * exactly the confusion this page is laid out to prevent.
  *
  * Client Component throughout: every meaningful piece of state
  * (Notification.permission, display-mode: standalone, an existing
@@ -150,6 +160,48 @@ async function readPushState(): Promise<PushState> {
 }
 
 // ---------------------------------------------------------------------------
+// Nudge message
+// ---------------------------------------------------------------------------
+
+/**
+ * `profiles_nudge_message_len_chk` allows 1..200 characters, and both
+ * `set_nudge_message` and `send_nudge` truncate with `left(btrim(...), 200)`.
+ * Migration 0009's self-check refuses to run if those three ever disagree.
+ *
+ * Duplicated from app/settings/nudge-message-actions.ts, which cannot export a
+ * constant: a `'use server'` module may only export async functions.
+ */
+const MAX_NUDGE_MESSAGE_LENGTH = 200
+
+/**
+ * Postgres `char_length` counts CODE POINTS, and so must this.
+ *
+ * `'가'.length` and `'a'.length` are both 1, so a naive `.length` agrees with
+ * Postgres for Korean — but an emoji is one code point and TWO UTF-16 units, so
+ * `'🙂'.length === 2` while `char_length('🙂') = 1`. A counter built on
+ * `.length` would tell someone they are over the limit when the server is
+ * perfectly happy, and `slice(0, 200)` could split a surrogate pair into a
+ * broken character. `Array.from` iterates code points, so it does neither.
+ */
+function codePointLength(value: string): number {
+  return Array.from(value).length
+}
+
+/** What the DB holds vs. what the textarea shows. */
+type MessageLoad =
+  | { kind: 'loading' }
+  | { kind: 'ready' }
+  | { kind: 'error'; message: string }
+
+/** Korean copy for the failures the two Server Actions can report. */
+const MESSAGE_ERROR_KO: Record<NudgeMessageErrorCode, string> = {
+  auth: '로그인이 풀렸어요. 앱을 새로고침한 뒤 다시 시도해 주세요.',
+  noprofile: '프로필을 찾지 못했어요. 앱을 새로고침한 뒤 다시 시도해 주세요.',
+  notdeployed: '이 기능이 아직 서버에 적용되지 않았어요. 잠시 후 다시 시도해 주세요.',
+  fail: '저장하지 못했어요. 잠시 후 다시 시도해 주세요.',
+}
+
+// ---------------------------------------------------------------------------
 // Auto reminder state
 // ---------------------------------------------------------------------------
 
@@ -205,6 +257,8 @@ const secondaryButton =
   'border-line text-fg h-12 w-full rounded-xl border text-base font-medium transition active:scale-[0.99] disabled:opacity-40'
 const selectClass =
   'border-line bg-surface-2 text-fg h-12 flex-1 rounded-xl border px-3 tabular-nums disabled:opacity-40'
+const textareaClass =
+  'border-line bg-surface-2 text-fg placeholder:text-muted min-h-24 w-full resize-y rounded-xl border p-3 text-base leading-relaxed disabled:opacity-40'
 
 // ---------------------------------------------------------------------------
 // Page
@@ -229,6 +283,15 @@ export default function SettingsPage() {
   const [saveError, setSaveError] = useState<string | null>(null)
 
   const [timezone, setTimezone] = useState<string | null>(null)
+
+  // ---- 콕 찌르기 메시지 ---------------------------------------------------
+  const [messageLoad, setMessageLoad] = useState<MessageLoad>({ kind: 'loading' })
+  /** What `profiles.nudge_message` actually holds. NULL = 설정 안 함. */
+  const [savedMessage, setSavedMessage] = useState<string | null>(null)
+  const [draft, setDraft] = useState('')
+  const [messageSaving, setMessageSaving] = useState(false)
+  const [messageNotice, setMessageNotice] = useState<string | null>(null)
+  const [messageError, setMessageError] = useState<string | null>(null)
 
   // ---- push state, resolved after mount ----------------------------------
 
@@ -332,6 +395,44 @@ export default function SettingsPage() {
     }
   }, [])
 
+  // ---- saved nudge message ------------------------------------------------
+
+  // Its own effect rather than one more column on the profiles read above: the
+  // Server Action is what will keep write and read-back in the same place, and
+  // a failure here must not take the reminder form down with it.
+  useEffect(() => {
+    let cancelled = false
+
+    void loadNudgeMessage()
+      .then((result) => {
+        if (cancelled) return
+        if (!result.ok) {
+          setMessageLoad({
+            kind: 'error',
+            message:
+              result.code === 'notdeployed'
+                ? '이 기능이 아직 서버에 적용되지 않았어요. 잠시 후 다시 시도해 주세요.'
+                : result.code === 'auth'
+                  ? '로그인이 풀렸어요. 앱을 새로고침해 주세요.'
+                  : '찌르기 메시지를 불러오지 못했어요.',
+          })
+          return
+        }
+        setSavedMessage(result.message)
+        setDraft(result.message ?? '')
+        setMessageLoad({ kind: 'ready' })
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setMessageLoad({ kind: 'error', message: '찌르기 메시지를 불러오지 못했어요.' })
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   // ---- push actions -------------------------------------------------------
 
   async function enablePush() {
@@ -426,10 +527,61 @@ export default function SettingsPage() {
     setSaveError(null)
   }
 
+  // ---- save the nudge message ---------------------------------------------
+
+  /**
+   * `set_nudge_message` is `returns void` AND silently truncates at 200, so the
+   * only trustworthy value is the one the action read back afterwards. The
+   * textarea is re-rendered from THAT, not from what was typed — otherwise a
+   * 201-character message would keep showing its 201st character forever while
+   * the database held 200.
+   */
+  async function submitMessage(next: string) {
+    setMessageSaving(true)
+    setMessageNotice(null)
+    setMessageError(null)
+
+    try {
+      const result = await saveNudgeMessage(next)
+
+      if (!result.ok) {
+        setMessageError(MESSAGE_ERROR_KO[result.code])
+        return
+      }
+
+      setSavedMessage(result.message)
+      setDraft(result.message ?? '')
+      setMessageNotice(
+        result.message === null
+          ? '메시지를 지웠어요. 이제 기본 문구로 찔러요.'
+          : result.truncated
+            ? `${MAX_NUDGE_MESSAGE_LENGTH}자가 넘어서 앞부분만 저장했어요.`
+            : !result.verified
+              ? '저장했어요. 다만 저장된 값을 다시 확인하지는 못했어요.'
+              : '메시지를 저장했어요.',
+      )
+    } catch {
+      setMessageError('저장하지 못했어요. 잠시 후 다시 시도해 주세요.')
+    } finally {
+      setMessageSaving(false)
+    }
+  }
+
   // ---- render -------------------------------------------------------------
 
   const pushIsOn = push.kind === 'on'
   const autoReady = autoLoad.kind === 'ready'
+
+  const messageReady = messageLoad.kind === 'ready'
+  /**
+   * Counted on the TRIMMED draft, because that is what the server measures:
+   * `left(btrim(...), 200)`. Trailing spaces are not part of the message and
+   * showing them in the count would put the number and the limit out of step.
+   */
+  const draftLength = codePointLength(draft.trim())
+  const overLimit = draftLength > MAX_NUDGE_MESSAGE_LENGTH
+  /** Compared trimmed, since a trailing space alone changes nothing on save. */
+  const messageDirty = draft.trim() !== (savedMessage ?? '')
 
   return (
     <Screen>
@@ -645,6 +797,113 @@ export default function SettingsPage() {
                 {lastOn ? ` (마지막 발송: ${lastOn})` : ' (아직 받은 적 없어요)'}
               </Hint>
             )}
+          </>
+        )}
+      </Section>
+
+      {/* ---------------------------------------------------------------- */}
+      {/* 3. 콕 찌르기 메시지                                                */}
+      {/* ---------------------------------------------------------------- */}
+      <Section title="콕 찌르기 메시지">
+        <Hint>
+          내가 친구를 <strong className="text-fg">콕 찌를 때</strong> 친구 알림에 뜨는
+          문구예요. 비워두면 기본 문구{' '}
+          <strong className="text-fg">“오늘 할 일 적었어요?”</strong>가 대신 갑니다.
+        </Hint>
+
+        {messageLoad.kind === 'loading' && (
+          <p className="text-muted text-sm" aria-live="polite" aria-busy="true">
+            저장된 메시지를 불러오는 중이에요.
+          </p>
+        )}
+
+        {messageLoad.kind === 'error' && (
+          <>
+            <p className="text-danger text-sm" role="alert">
+              {messageLoad.message}
+            </p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className={secondaryButton}
+            >
+              다시 불러오기
+            </button>
+          </>
+        )}
+
+        {messageReady && (
+          <>
+            <label className="sr-only" htmlFor="nudge-message">
+              콕 찌르기 메시지
+            </label>
+            <textarea
+              id="nudge-message"
+              value={draft}
+              onChange={(event) => {
+                setDraft(event.target.value)
+                setMessageNotice(null)
+                setMessageError(null)
+              }}
+              disabled={messageSaving}
+              rows={3}
+              // No maxLength: the attribute counts UTF-16 units, so it would cut
+              // an emoji message short of the 200 code points the server allows.
+              // The counter below and the server's own truncation handle it.
+              placeholder="예) 오늘 할 일 아직이야? 같이 하자"
+              aria-describedby="nudge-message-count"
+              className={textareaClass}
+            />
+
+            <p
+              id="nudge-message-count"
+              className={`text-sm tabular-nums ${overLimit ? 'text-danger' : 'text-muted'}`}
+              aria-live="polite"
+            >
+              {draftLength} / {MAX_NUDGE_MESSAGE_LENGTH}자
+              {overLimit ? ' — 저장하면 앞부분만 남아요.' : null}
+            </p>
+
+            <button
+              type="button"
+              onClick={() => submitMessage(draft)}
+              disabled={messageSaving || !messageDirty}
+              className={primaryButton}
+            >
+              {messageSaving ? '저장 중…' : messageDirty ? '저장하기' : '저장됨'}
+            </button>
+
+            {savedMessage !== null && (
+              <button
+                type="button"
+                onClick={() => submitMessage('')}
+                disabled={messageSaving}
+                className={secondaryButton}
+              >
+                메시지 지우기
+              </button>
+            )}
+
+            {messageNotice && (
+              <p className="text-fg text-sm" role="status" aria-live="polite">
+                {messageNotice}
+              </p>
+            )}
+            {messageError && (
+              <p className="text-danger text-sm" role="alert">
+                {messageError}
+              </p>
+            )}
+
+            <Hint>
+              지금은{' '}
+              {savedMessage === null ? (
+                <strong className="text-fg">기본 문구</strong>
+              ) : (
+                <strong className="text-fg">“{savedMessage}”</strong>
+              )}
+              로 찔러요. 같은 그룹 친구는 이 문구를 미리 볼 수도 있어요.
+            </Hint>
           </>
         )}
       </Section>

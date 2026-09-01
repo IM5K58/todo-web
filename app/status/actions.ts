@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { redirect } from 'next/navigation'
 
+import { loadNudgeMessage } from '@/app/settings/nudge-message-actions'
 import {
   EMPTY_FANOUT,
   PushConfigurationError,
@@ -89,6 +90,13 @@ export type StatusErrCode =
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
+/**
+ * What the push says when the sender has not written a message of their own.
+ * Same string app/api/nudge/route.ts falls back to, so both nudge paths read
+ * identically on the lock screen.
+ */
+const DEFAULT_NUDGE_BODY = '오늘 할 일 적었어요?'
+
 function uuidField(formData: FormData, name: string): string | null {
   const raw = formData.get(name)
   if (typeof raw !== 'string') return null
@@ -171,10 +179,32 @@ export async function nudgeAction(formData: FormData): Promise<void> {
   // trip; the page never renders the button on your own row in the first place.
   if (callerId === targetUserId) fail('self', groupId)
 
-  const { data, error } = await supabase.rpc('send_nudge', {
-    p_to_user_id: targetUserId,
-    p_group_id: groupId,
-  })
+  // 설정 › 콕 찌르기 메시지. Strictly additive: the nudge is the point, the
+  // message is decoration, so a failed read must degrade to the default copy
+  // rather than abort. `loadNudgeMessage()` reads auth.uid()'s own row only —
+  // it never reaches another member's profile.
+  let myMessage: string | null = null
+  try {
+    const loaded = await loadNudgeMessage()
+    if (loaded.ok) myMessage = loaded.message
+    else console.error('[status/nudge] nudge message lookup failed', loaded.code)
+  } catch (cause) {
+    console.error('[status/nudge] nudge message lookup threw', {
+      message: cause instanceof Error ? cause.message : String(cause),
+    })
+  }
+
+  // Built incrementally rather than passing `p_message: null`: the generated
+  // Args type declares the defaulted parameters as optional, and omitting one
+  // is what makes Postgres apply its own DEFAULT.
+  const args: {
+    p_to_user_id: string
+    p_group_id: string
+    p_message?: string
+  } = { p_to_user_id: targetUserId, p_group_id: groupId }
+  if (myMessage) args.p_message = myMessage
+
+  const { data, error } = await supabase.rpc('send_nudge', args)
 
   if (error) {
     // send_nudge raises 42501 only when auth.uid() is null — the cookie parsed
@@ -232,10 +262,13 @@ export async function nudgeAction(formData: FormData): Promise<void> {
 
     delivery = await sendPushToUser(targetUserId, {
       title: `${senderName}님이 콕 찔렀어요`,
-      // Deliberately generic. A push notification lands on a lock screen, a
-      // paired watch, a mirrored car display — the recipient's task titles and
-      // the group name have no business being there (0003 §13(i)).
-      body: '오늘 할 일 적었어요?',
+      // The sender's own sentence, or the generic default. A push notification
+      // lands on a lock screen, a paired watch, a mirrored car display — the
+      // RECIPIENT's task titles and the group name still have no business being
+      // there (0003 §13(i)), and nothing below reads them. A message the sender
+      // wrote for this exact purpose is a different thing, and it is the same
+      // substitution app/api/nudge/route.ts already makes.
+      body: myMessage ?? DEFAULT_NUDGE_BODY,
       url: '/',
       // Collapse repeat nudges from the same sender into one notification.
       tag: `nudge-${callerId}`,

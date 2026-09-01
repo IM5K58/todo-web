@@ -1,12 +1,15 @@
+import Link from 'next/link'
 import { redirect } from 'next/navigation'
 
 import { Screen } from '@/components/screen'
 import { Button, Card, EmptyState, ErrorText, Hint, LinkButton, SuccessText } from '@/components/ui'
 import { requireUserId } from '@/lib/auth'
+import { getTimeline } from '@/lib/posts'
 import { createClient } from '@/lib/supabase/server'
 import { STREAK_WINDOW_DAYS, getTodayPageData } from '@/lib/tasks'
 import type { Weekday } from '@/lib/supabase/types'
 
+import GroupPledge from './group-pledge'
 import GroupSwitcher from './group-switcher'
 import {
   applyTemplatesAction,
@@ -14,6 +17,8 @@ import {
   type FillErrCode,
   type FillKind,
 } from './templates/actions'
+import Composer from './timeline/composer'
+import Feed from './timeline/feed'
 import TodayTasks, { type TodayTaskView } from './today-tasks'
 
 /**
@@ -261,6 +266,50 @@ function countParam(raw: string | string[] | undefined): number {
   return value
 }
 
+/* ---------------------------------------------------------------------------
+ * [0010] 상단 탭 — '내 할 일' / '타임라인'
+ * ------------------------------------------------------------------------ */
+
+/**
+ * 홈은 이제 두 화면입니다.
+ *   · tasks — 오늘 **할** 일 (기존 홈. 기본값)
+ *   · feed  — 오늘 **한** 일 (타임라인. 0010 의 posts)
+ *
+ * ★ 상태를 URL 에 남기는 이유 ★ useState 로 두면 새로고침에서 탭이 튀고,
+ * 뒤로가기가 홈을 통째로 벗어납니다. 게시물을 올린 뒤 액션이 revalidate 하고
+ * 돌아오는 자리도, 삭제 후 redirect 하는 자리도 전부 "그 탭" 이어야 합니다.
+ * 그래서 ?tab=feed 이고, 서버 컴포넌트가 그 값을 읽어 한쪽만 그립니다.
+ *
+ * ★ 기본이 tasks 인 이유 ★ 이 URL 은 매니페스트의 start_url 이자 푸시 알림이
+ * 여는 주소입니다. 알림("오늘 할 일 안 끝났어요")을 눌렀는데 타임라인이 열리면
+ * 알림이 거짓말을 한 셈이 됩니다. 그래서 모르는 값·없는 값은 전부 tasks 입니다.
+ */
+type HomeTab = 'tasks' | 'feed'
+
+function tabParam(raw: string | string[] | undefined): HomeTab {
+  return raw === 'feed' ? 'feed' : 'tasks'
+}
+
+/**
+ * 탭 링크의 주소. 지금 보고 있는 그룹을 **반드시** 달고 다닙니다.
+ *
+ * 안 달면 탭을 누를 때마다 그룹 판정이 처음부터 다시 돌고(?g= 없음 →
+ * default_group_id → 첫 그룹), 드롭다운으로 잠깐 다른 그룹을 보던 사람은
+ * 탭 한 번에 원래 그룹으로 튕겨 나갑니다.
+ */
+function homeTabHref(groupId: string, tab: HomeTab): string {
+  return `/?g=${groupId}&tab=${tab}`
+}
+
+/** 게시물 삭제(app/timeline/actions.ts)가 `?perr=` 로 실어 보내는 코드의 문구. */
+const POST_ERR_MESSAGES: Record<string, string> = {
+  auth: '로그인이 풀렸어요. 앱을 새로고침한 뒤 다시 시도해 주세요.',
+  badrequest: '요청이 올바르지 않아요. 화면을 새로고침한 뒤 다시 시도해 주세요.',
+  notfound: '이미 지워졌거나, 내가 쓴 글이 아니에요.',
+  notdeployed: '타임라인 기능이 아직 서버에 적용되지 않았어요. 잠시 후 다시 시도해 주세요.',
+  fail: '지우지 못했어요. 잠시 후 다시 시도해 주세요.',
+}
+
 const FILL_ERR_MESSAGES: Record<FillErrCode, string> = {
   auth: '로그인이 풀렸어요. 앱을 새로고침한 뒤 다시 시도해 주세요.',
   badrequest: '요청이 올바르지 않아요. 화면을 새로고침한 뒤 다시 시도해 주세요.',
@@ -341,9 +390,11 @@ export default async function TodayPage({
   searchParams,
 }: {
   /**
-   * 읽는 것은 둘뿐입니다:
+   * 읽는 것은 넷뿐입니다:
    *   · fill / c / s / fillerr — 0004 "오늘 채우기" 의 결과 알림
    *   · g                      — 헤더 드롭다운이 고른 그룹 (아래 groupParam)
+   *   · tab                    — [0010] '내 할 일' / '타임라인' (기본 tasks)
+   *   · pdel / perr            — [0010] 게시물 삭제 결과
    * 그 외 파라미터는 무시하고, 이 화면의 데이터 로딩에 아무 영향을 주지 않습니다.
    */
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>
@@ -351,6 +402,14 @@ export default async function TodayPage({
   const params = await searchParams
 
   const preferredGroupId = groupParam(params.g)
+  const tab = tabParam(params.tab)
+
+  const postDeleted = params.pdel === '1'
+  const postErrMessage =
+    typeof params.perr === 'string' &&
+    Object.prototype.hasOwnProperty.call(POST_ERR_MESSAGES, params.perr)
+      ? POST_ERR_MESSAGES[params.perr]
+      : null
 
   const fillKind =
     params.fill === 'applied' || params.fill === 'copied' ? (params.fill as FillKind) : null
@@ -480,7 +539,10 @@ export default async function TodayPage({
   //    경로에서는 추가 비용이 정확히 0 입니다.
   //    (두 질의끼리는 서로 독립이라 Promise.all 로 한 파에 넣습니다.)
   // -------------------------------------------------------------------------
-  const showQuickFill = !tasksFailed && todayTasks.length === 0
+  //
+  // [0010] `tab === 'tasks'` 조건이 하나 더 붙었습니다. 타임라인 탭에서는 이
+  // 카드가 화면에 없으므로, 그걸 계산하려고 왕복을 내는 것은 순수한 낭비입니다.
+  const showQuickFill = tab === 'tasks' && !tasksFailed && todayTasks.length === 0
   const yesterday = ISO_DATE_RE.test(data.today) ? previousDate(data.today) : null
 
   let applicableTemplateCount = 0
@@ -528,6 +590,21 @@ export default async function TodayPage({
 
     yesterdayTaskCount = yesterdayResult.error ? 0 : (yesterdayResult.count ?? 0)
   }
+
+  // -------------------------------------------------------------------------
+  // [0010] 타임라인 — 그 탭을 열었을 때만 조회합니다
+  //
+  // ★ 왜 위의 Promise.all 에 못 넣는가 ★ 이 질의는 activeGroup.id 를 필요로
+  // 하는데, 그 값은 첫 파의 결과(groups + default_group_id)로 결정됩니다.
+  // 그래서 구조적으로 두 번째 파입니다. 대신 그 비용을 '내 할 일' 탭이 내지
+  // 않게 합니다 — 기본 탭의 왕복 수는 0010 이전과 정확히 같습니다.
+  //
+  // 조회 범위: 이 그룹, 최신순, 최대 TIMELINE_LIMIT 개(lib/posts.ts).
+  // 사진은 비공개 버킷이라 서명 URL 이 필요하고, 그 발급 규칙(사용자 토큰으로
+  // 조회한 경로만 서명)은 전부 lib/posts.ts 안에 있습니다. 이 화면은 경로를
+  // 만지지 않습니다.
+  // -------------------------------------------------------------------------
+  const timeline = tab === 'feed' ? await getTimeline(activeGroup.id, userId) : null
 
   const headerDate = ISO_DATE_RE.test(data.today)
     ? formatKoreanDate(data.today)
@@ -586,6 +663,45 @@ export default async function TodayPage({
       </header>
 
       {needsOnboarding && <OnboardingNudge />}
+
+      {/* ---- 그룹 공약 (0009) ------------------------------------------- */}
+      {/*
+        app/group-pledge.tsx 가 소유합니다. 그룹을 여기서 정해 넘기는 이유는 그
+        파일의 계약 그대로입니다 — 홈이 이미 "지금 보는 그룹"을 계산해 두었고,
+        같은 판정을 두 곳에서 하면 두 카드가 서로 다른 그룹을 그릴 수 있습니다.
+        탭 위에 두는 것은 공약이 탭에 속한 내용이 아니라 그룹에 속한 내용이라서
+        입니다 — 할 일을 보든 타임라인을 보든 같은 약속이 위에 있어야 합니다.
+        공약이 없고 관리자도 아니면 이 컴포넌트는 아무것도 그리지 않습니다.
+      */}
+      <GroupPledge groupId={activeGroup.id} />
+
+      {/* ---- 상단 탭 (0010) --------------------------------------------- */}
+      {/*
+        <nav> + <Link> 입니다. 버튼과 client state 로 만들지 않은 이유는 위
+        tabParam 주석 참고 — 새로고침·뒤로가기·알림에서 열기가 전부 동작해야
+        하고, 그건 주소가 상태를 들고 있을 때만 공짜로 따라옵니다.
+        aria-current="page" 가 스크린리더에게 지금 어느 탭인지 말해 줍니다.
+      */}
+      <nav aria-label="홈 화면 전환" className="border-line bg-surface-2 flex gap-1 rounded-xl border p-1">
+        {(
+          [
+            { key: 'tasks', label: '내 할 일' },
+            { key: 'feed', label: '타임라인' },
+          ] as const
+        ).map(({ key, label }) => (
+          <Link
+            key={key}
+            href={homeTabHref(activeGroup.id, key)}
+            aria-current={tab === key ? 'page' : undefined}
+            // min-h-11 = 44px, iOS 최소 터치 타깃.
+            className={`inline-flex min-h-11 flex-1 items-center justify-center rounded-lg px-3 text-sm font-medium transition active:scale-[0.99] ${
+              tab === key ? 'bg-accent text-accent-fg' : 'text-muted'
+            }`}
+          >
+            {label}
+          </Link>
+        ))}
+      </nav>
 
       {/* ---- 채우기 결과 ------------------------------------------------ */}
       {/*
@@ -667,26 +783,65 @@ export default async function TodayPage({
       )}
 
       {/* ---- 오늘 할 일 ------------------------------------------------ */}
-      {tasksFailed ? (
-        <Card title="할 일을 불러오지 못했어요">
-          <ErrorText>{data.error}</ErrorText>
-          <Hint>아직 아무것도 지워지지 않았어요. 다시 불러오면 그대로 보일 거예요.</Hint>
-          {/* Same reasoning as LoadError: a soft navigation to '/' could be
-              served from the router cache without re-running the query. */}
-          <a
-            href="/"
-            className="border-line bg-surface text-fg inline-flex h-12 w-full shrink-0 items-center justify-center rounded-xl border px-4 text-base font-medium transition active:scale-[0.99]"
-          >
-            다시 불러오기
-          </a>
-        </Card>
-      ) : (
-        <TodayTasks
-          tasks={todayTasks}
-          groupId={activeGroup.id}
-          groupName={activeGroup.name}
-          showGroupHint={otherGroupCount > 0}
-        />
+      {tab === 'tasks' &&
+        (tasksFailed ? (
+          <Card title="할 일을 불러오지 못했어요">
+            <ErrorText>{data.error}</ErrorText>
+            <Hint>아직 아무것도 지워지지 않았어요. 다시 불러오면 그대로 보일 거예요.</Hint>
+            {/* Same reasoning as LoadError: a soft navigation to '/' could be
+                served from the router cache without re-running the query. */}
+            <a
+              href="/"
+              className="border-line bg-surface text-fg inline-flex h-12 w-full shrink-0 items-center justify-center rounded-xl border px-4 text-base font-medium transition active:scale-[0.99]"
+            >
+              다시 불러오기
+            </a>
+          </Card>
+        ) : (
+          <TodayTasks
+            tasks={todayTasks}
+            groupId={activeGroup.id}
+            groupName={activeGroup.name}
+            showGroupHint={otherGroupCount > 0}
+          />
+        ))}
+
+      {/* ---- 타임라인 (0010) -------------------------------------------- */}
+      {/*
+        "계획" 이 아니라 "오늘 한 일" 입니다. 그래서 체크박스가 아니라 카드이고,
+        완료/미완료 같은 상태가 없습니다 — 올린 순간 이미 한 일입니다.
+        작성 카드가 목록 위에 있는 이유: 이 탭에 오는 가장 흔한 이유가 "올리려고"
+        이고, 목록 아래에 두면 30개를 스크롤해야 입력창을 만납니다.
+      */}
+      {tab === 'feed' && timeline && (
+        <>
+          {postDeleted && (
+            <div className="border-line bg-surface rounded-2xl border p-4">
+              <SuccessText>게시물을 지웠어요.</SuccessText>
+            </div>
+          )}
+          {postErrMessage && (
+            <div className="border-danger rounded-2xl border p-4">
+              <ErrorText>{postErrMessage}</ErrorText>
+            </div>
+          )}
+
+          <Composer
+            groupId={activeGroup.id}
+            // 검증된 JWT 의 sub 입니다(lib/auth.ts). 경로 <uid>/<파일> 의 앞부분이
+            // 되고, Storage 정책과 posts_photo_path_owner_chk 가 서버에서 같은
+            // 조건을 다시 강제합니다.
+            userId={userId}
+            groupName={activeGroup.name}
+          />
+
+          <Feed
+            data={timeline}
+            timeZone={timeZone}
+            groupId={activeGroup.id}
+            groupName={activeGroup.name}
+          />
+        </>
       )}
 
       {/* ---- 이동 ------------------------------------------------------ */}
@@ -705,6 +860,15 @@ export default async function TodayPage({
         */}
         <LinkButton href="/templates" variant="secondary">
           반복 할 일 관리
+        </LinkButton>
+        {/*
+          [0011] 루틴. /templates 와 다른 화면입니다 — templates 는 "오늘 목록을
+          채워 주는 틀"이고, routines 는 "누가 언제 하기로 했는지"까지 나눠 갖는
+          쪽입니다. 라우트는 routines 에이전트가 통째로 소유하고, 홈은 이 한 줄만
+          들고 있습니다.
+        */}
+        <LinkButton href="/routines" variant="secondary">
+          우리 루틴
         </LinkButton>
       </div>
 

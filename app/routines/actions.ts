@@ -248,7 +248,7 @@ export async function toggleRoutineCheckinAction(formData: FormData): Promise<vo
   if (!userId) backToRoutines('auth')
 
   const supabase = await createClient()
-  const rpc = supabase.rpc as unknown as ToggleRoutineCheckinRpc
+  const rpc = supabase.rpc.bind(supabase) as unknown as ToggleRoutineCheckinRpc
 
   const { data, error } = await rpc('toggle_routine_checkin', { p_routine_id: routineId })
 
@@ -317,7 +317,7 @@ async function upsertRoutine(formData: FormData, isCreate: boolean): Promise<voi
   if (!userId) backToAdmin(groupId, { err: 'auth' })
 
   const supabase = await createClient()
-  const rpc = supabase.rpc as unknown as UpsertRoutineRpc
+  const rpc = supabase.rpc.bind(supabase) as unknown as UpsertRoutineRpc
 
   const { data, error } = await rpc('upsert_routine', {
     p_id: routineId,
@@ -395,7 +395,7 @@ export async function setRoutineAssigneesAction(formData: FormData): Promise<voi
   if (!userId) backToAdmin(groupId, { err: 'auth' })
 
   const supabase = await createClient()
-  const rpc = supabase.rpc as unknown as SetRoutineAssigneesRpc
+  const rpc = supabase.rpc.bind(supabase) as unknown as SetRoutineAssigneesRpc
 
   const { error } = await rpc('set_routine_assignees', {
     p_routine_id: routineId,

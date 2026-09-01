@@ -132,7 +132,7 @@ export async function setDefaultGroupAction(formData: FormData): Promise<void> {
     backTo(groupId, 'e_auth')
   }
 
-  const rpc = supabase.rpc as unknown as SetDefaultGroupRpc
+  const rpc = supabase.rpc.bind(supabase) as unknown as SetDefaultGroupRpc
   const { error } = await rpc('set_default_group', {
     // null clears the pin. 0007 treats it as "고정 해제", not as an error.
     p_group_id: pin ? groupId : null,

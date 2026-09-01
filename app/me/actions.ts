@@ -426,7 +426,7 @@ export async function setAvatar(avatarUrl: string | null): Promise<MeActionResul
   // 라서 읽을 행이 없으므로 error 만 봅니다. types.ts 에 항목이 생기면 이 두 줄을
   // 지우고 `supabase.rpc('set_avatar', …)` 를 그대로 부르면 됩니다.
   // (app/status/default-group-actions.ts 가 set_default_group 에 쓴 것과 같은 처방)
-  const rpc = supabase.rpc as unknown as SetAvatarRpc
+  const rpc = supabase.rpc.bind(supabase) as unknown as SetAvatarRpc
 
   const { error } = await rpc('set_avatar', {
     // 빈 문자열도 set_avatar 안에서 nullif(btrim(...), '') 로 NULL 이 되지만,

@@ -247,7 +247,7 @@ function asPeriod(value: unknown): RoutinePeriod {
  */
 export async function amIAdmin(): Promise<boolean> {
   const supabase = await createClient()
-  const rpc = supabase.rpc as unknown as AmIAdminRpc
+  const rpc = supabase.rpc.bind(supabase) as unknown as AmIAdminRpc
 
   const { data, error } = await rpc('am_i_admin')
 
@@ -275,7 +275,7 @@ export async function getMyRoutines(): Promise<{
   error: string | null
 }> {
   const supabase = await createClient()
-  const rpc = supabase.rpc as unknown as GetMyRoutinesRpc
+  const rpc = supabase.rpc.bind(supabase) as unknown as GetMyRoutinesRpc
 
   const { data, error } = await rpc('get_my_routines')
 

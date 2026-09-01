@@ -138,7 +138,7 @@ export async function savePledgeAction(formData: FormData): Promise<never> {
   if (pledgeLength(body) > PLEDGE_BODY_MAX) back(groupId, 'err=toolong')
 
   const supabase = await createClient()
-  const rpc = supabase.rpc as unknown as SetGroupPledgeRpc
+  const rpc = supabase.rpc.bind(supabase) as unknown as SetGroupPledgeRpc
 
   // 빈 문자열도 RPC 안에서 NULL 이 되지만, 의도를 값에서 읽을 수 있게 여기서
   // null 로 만들어 보냅니다(= "이 그룹의 공약을 지운다").

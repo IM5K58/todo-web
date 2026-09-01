@@ -137,7 +137,7 @@ export async function readGroupPledge(
   supabase: SupabaseServerClient,
   groupId: string,
 ): Promise<PledgeRead> {
-  const from = supabase.from as unknown as PledgeSelect
+  const from = supabase.from.bind(supabase) as unknown as PledgeSelect
 
   const { data, error } = await from('group_pledges')
     .select('body')
@@ -166,7 +166,7 @@ export async function readGroupPledge(
  * 이 화면이 피하려는 바로 그 고장입니다.
  */
 export async function amIAppAdmin(supabase: SupabaseServerClient): Promise<boolean> {
-  const rpc = supabase.rpc as unknown as AmIAdminRpc
+  const rpc = supabase.rpc.bind(supabase) as unknown as AmIAdminRpc
 
   const { data, error } = await rpc('am_i_admin')
 

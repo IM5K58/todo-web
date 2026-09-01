@@ -54,6 +54,8 @@ const TABS = [
  */
 const TAB_ALIASES: ReadonlyArray<readonly [prefix: string, tabHref: string]> = [
   ['/groups', '/status'],
+  // /members/[userId] 는 현황의 멤버 행에서만 들어갑니다.
+  ['/members', '/status'],
   ['/settings', '/me'],
   ['/templates', '/'],
 ]

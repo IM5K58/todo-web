@@ -3,6 +3,7 @@ import type { Metadata, Viewport } from 'next'
 import { SerwistProvider } from '@serwist/turbopack/react'
 
 import BottomNav from '@/app/(nav)/BottomNav'
+import InstallBanner from '@/app/install-banner'
 
 import './globals.css'
 
@@ -74,6 +75,8 @@ export default function RootLayout({
   return (
     <html lang="ko">
       <body className="bg-bg text-fg min-h-dvh">
+        {/* 설치 안내 배너. 화면 상단 고정, 아직 설치하지 않은 사람에게만. */}
+        <InstallBanner />
         {/*
          * 서비스워커 등록. 이게 없으면 워커가 영영 등록되지 않고,
          * 그 결과 (a) 크롬/안드로이드 설치 배너가 뜨지 않으며

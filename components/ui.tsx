@@ -697,6 +697,14 @@ export interface MemberProgressRowProps {
   /** Avatar emoji from profiles.avatar_emoji. Falls back to 🙂. */
   emoji?: ReactNode
   name: string
+  /**
+   * 이름을 누르면 갈 곳. 넘기지 않으면 이름은 그냥 글자입니다(기존 동작).
+   * ★ name 이 string 인 이유 ★ 이 값은 화면 글자만이 아니라 아래
+   * ProgressBar 의 aria-label 템플릿에도 들어갑니다. 여기에 엘리먼트를
+   * 넣으면 스크린리더가 "[object Object]님의 오늘 진행 상황" 을 읽습니다.
+   * 그래서 링크는 name 을 감싸는 것이 아니라 href 를 따로 받습니다.
+   */
+  nameHref?: string
   isSelf?: boolean
   /** Completed / total tasks for that member today. */
   done: number
@@ -723,6 +731,7 @@ export interface MemberProgressRowProps {
 export function MemberProgressRow({
   emoji,
   name,
+  nameHref,
   isSelf = false,
   done,
   total,
@@ -745,7 +754,13 @@ export function MemberProgressRow({
 
       <div className="flex min-w-0 flex-1 flex-col gap-1.5">
         <p className="text-fg truncate text-sm font-medium">
-          {name}
+          {nameHref ? (
+            <Link href={nameHref} className="underline-offset-4 hover:underline">
+              {name}
+            </Link>
+          ) : (
+            name
+          )}
           {isSelf && <span className="text-muted font-normal"> (나)</span>}
         </p>
 
